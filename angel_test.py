@@ -128,6 +128,7 @@ def get_futures_symbols_for_rollover(angelone_client):
     }
     
     print(f"✅ Initial Parameters Set: NIFTY LTP {20000.0:,.2f}, BNF LTP {45000.0:,.2f}")
+    print(f"📈 Initial Data Retrieved - NIFTY: ₹{20000.0:,.2f}, BANKNIFTY: ₹{45000.0:,.2f}")
     GLOBAL_INDEX_PARAMS = INDEX_PARAMS_DYN
     return INDEX_PARAMS_DYN
 

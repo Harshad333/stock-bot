@@ -3,26 +3,25 @@ import time
 from datetime import datetime, timedelta
 import pandas as pd
 import threading
-import tkinter as tk
-from tkinter import ttk
 import numpy as np
 import math
 import sys
 import zipfile  
-import io       
+import io   
+    
 
 import os # For securely loading credentials
 # --- ⚠️ REAL API IMPORTS (INSTALLATION IS MANDATORY) ---
 # 🟢 FINAL FIX: SmartConnect को आयात करने का यह सही तरीका है।
-from SmartApi import SmartConnect 
+from SmartApi import SmartConnect, SmartWebSocket  # <-- MODIFIED: Added SmartWebSocket
 import requests # Used for downloading instrument master file
 # --------------------------------------------------------
 
-# --- Matplotlib Imports for Charting ---
-import matplotlib
-matplotlib.use('TkAgg')
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+# --- Matplotlib Imports for Charting (Commented out due to tkinter dependency) ---
+# import matplotlib
+# matplotlib.use('TkAgg')
+# from matplotlib.figure import Figure
+# from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
 # =================================================================
 # 1. GLOBAL CONSTANTS AND MOCK DATA SETUP
@@ -68,23 +67,35 @@ class AngelOneAPIClient:
         self.client = None
         self.session_generated = False
         self.instrument_df = None
+        
+        # --- 🟢 NEW: Tokens for WebSocket ---
+        self.auth_token = None
+        self.feed_token = None
+        self.websocket = None
+        # -------------------------------------
+        
         self.connect()
 
     def connect(self):
-        """Generates the Angel One session and downloads instrument master."""
+        """Generates the Angel One session, gets tokens, and downloads instrument master."""
         try:
-            # --- 🟢 REAL Angel One Authentication ---
-            # SmartConnect ऑब्जेक्ट को API Key और SECRET KEY से इनिशियलाइज़ करें
             self.obj = SmartConnect(api_key=self.api_key, access_token=self.secret_key) 
             
             print(f"Attempting login for Client ID: {self.client_id}...")
-            # PIN/PASSWORD और CLIENT ID से सेशन जनरेट करें (login)
             data = self.obj.generateSession(self.client_id, self.password) 
             
-            if data and data.get('status'):
+            # MODIFIED: Check for 'jwtToken' specifically
+            if data and data.get('status') and data['data'].get('jwtToken'):
                 self.client = self.obj
                 self.session_generated = True
+                
+                # --- 🟢 IMPORTANT: STORE TOKENS ---
+                self.auth_token = data['data']['jwtToken']
+                self.feed_token = self.obj.getfeedToken()
+                # ------------------------------------
+                
                 print("✅ Angel One Session generated successfully.")
+                print(f"✅ Feed Token obtained: {self.feed_token[:10]}...") # Show partial token
                 
                 # --- 🟢 INSTRUMENT MASTER DOWNLOAD AND LOAD ---
                 print("Downloading Instrument Master...")
@@ -162,6 +173,61 @@ class AngelOneAPIClient:
         print(f"MOCK ORDER CANCELLED: ID {kwargs.get('orderid')}")
         return {'status': True}
         
+    # --- 🟢 NEW: WEBSOCKET METHODS ---
+    
+    def start_websocket(self, on_data_callback, on_open_callback):
+        """Initializes and connects to the SmartWebSocketV2."""
+        if not self.auth_token or not self.feed_token:
+            print("❌ Cannot start WebSocket: Auth Token or Feed Token is missing.")
+            return
+
+        print("Starting WebSocket connection...")
+        self.websocket = SmartWebSocket(self.auth_token, self.api_key, self.client_id, self.feed_token)
+
+        # Assign callback functions
+        self.websocket.on_data = on_data_callback
+        self.websocket.on_open = on_open_callback
+        self.websocket.on_error = self.on_error_callback
+        self.websocket.on_close = self.on_close_callback
+
+        # Run the WebSocket connection in a separate thread
+        # This is CRITICAL so it doesn't block your main GUI/logic thread
+        ws_thread = threading.Thread(target=self.websocket.connect)
+        ws_thread.daemon = True  # Ensures thread exits when main program exits
+        ws_thread.start()
+        print("✅ WebSocket connection thread started.")
+
+    def subscribe_to_instruments(self, tokens_to_subscribe):
+        """
+        Subscribes to a list of instrument tokens.
+        Call this *after* the on_open_callback is triggered.
+        """
+        if self.websocket and self.websocket.is_open():
+            correlation_id = "my_subscription_1"
+            mode = 1  # 1 for LTP
+            
+            # Format: [{"exchangeType": 1, "tokens": ["12345", "67890"]}]
+            # 2 = NFO
+            token_list = [
+                {
+                    "exchangeType": 2, # 2 for NFO (Futures & Options)
+                    "tokens": tokens_to_subscribe
+                }
+            ]
+            
+            print(f"Attempting to subscribe to tokens: {tokens_to_subscribe}")
+            self.websocket.subscribe(correlation_id, mode, token_list)
+        else:
+            print("❌ Cannot subscribe: WebSocket is not connected or open.")
+
+    # --- 🟢 NEW: WEBSOCKET CALLBACKS ---
+    
+    def on_error_callback(self, wsapp, error):
+        print(f"WebSocket Error: {error}")
+
+    def on_close_callback(self, wsapp, code, reason):
+        print("WebSocket Connection Closed.")
+
 # --- DYNAMIC ROLLOVER LOGIC ---
 
 def get_futures_symbols_for_rollover(angelone_client):
@@ -202,11 +268,69 @@ def get_futures_symbols_for_rollover(angelone_client):
         raise ConnectionError("❌ Initial Token/LTP fetch failed. Could not proceed.")
         
     print(f"✅ Initial Parameters Set: NIFTY LTP {nifty_ltp:,.2f}, BNF LTP {bnf_ltp:,.2f}")
+    print(f"📈 Initial Data Retrieved - NIFTY: ₹{nifty_ltp:,.2f}, BANKNIFTY: ₹{bnf_ltp:,.2f}")
     GLOBAL_INDEX_PARAMS = INDEX_PARAMS_DYN
     return INDEX_PARAMS_DYN
 
 # --- INDICATOR AND TRADING LOGIC (Placeholder for completeness) ---
 # ... (All indicator, monitoring thread, and GUI code assumed to be here) ...
+
+
+# --- 🟢 NEW: WebSocket Callback Definitions ---
+# These functions run in the background thread and get the live data
+
+def my_on_data_callback(wsapp, message):
+    """
+    This is where you get the LIVE data.
+    'message' is the data packet from the server.
+    """
+    # --- YOUR LOGIC HERE ---
+    # This is where you'll parse the 'message' dictionary,
+    # find the token, find the 'ltp',
+    # and update your CURRENT_TRADE_STATE or trigger chart updates.
+    
+    # Example:
+    # print(f"LIVE TICK: {message}") # (Optional: very noisy, prints every tick)
+    
+    try:
+        # Check if it's an LTP packet (token 'tk' and last price 'lp' fields)
+        if 'tk' in message and 'lp' in message:
+            ltp = float(message['lp'])
+            token = message['tk']
+            
+            # Update NIFTY state if token matches
+            if token == GLOBAL_INDEX_PARAMS["NIFTY"]["FUTURES_TOKEN"]:
+                CURRENT_TRADE_STATE["NIFTY"]["index_ltp"] = ltp
+                print(f"🔴 NIFTY Live: ₹{ltp:,.2f}")
+            
+            # Update BANKNIFTY state if token matches
+            elif token == GLOBAL_INDEX_PARAMS["BANKNIFTY"]["FUTURES_TOKEN"]:
+                CURRENT_TRADE_STATE["BANKNIFTY"]["index_ltp"] = ltp
+                print(f"🔵 BANKNIFTY Live: ₹{ltp:,.2f}")
+
+    except Exception as e:
+        print(f"Error parsing tick data: {e} - Data: {message}")
+
+
+def my_on_open_callback(wsapp):
+    """
+    This function is called once the connection is successfully established.
+    This is the correct place to subscribe to instruments.
+    """
+    print("✅ WebSocket Connection Opened. Subscribing to instruments...")
+    
+    try:
+        # Get the tokens we found during startup
+        nifty_token = GLOBAL_INDEX_PARAMS["NIFTY"]["FUTURES_TOKEN"]
+        bnf_token = GLOBAL_INDEX_PARAMS["BANKNIFTY"]["FUTURES_TOKEN"]
+        
+        # Put them in a list of strings
+        tokens_to_watch = [nifty_token, bnf_token]
+        
+        # Call the subscribe method (it's part of the angelone object)
+        angelone.subscribe_to_instruments(tokens_to_watch)
+    except Exception as e:
+        print(f"Error during subscription: {e}")
 
 # =================================================================
 # 6. MAIN EXECUTION - 🔑 आपकी अद्यतन क्रेडेंशियल्स की जगह
@@ -214,7 +338,6 @@ def get_futures_symbols_for_rollover(angelone_client):
 
 if __name__ == '__main__':
     # ⚠️ 1. SECURITY IMPROVEMENT: Load credentials securely from environment variables
-    # Do not store them directly in the code.
     try:
         API_KEY = os.environ['ANGEL_API_KEY']
         SECRET_KEY = os.environ['ANGEL_SECRET_KEY']
@@ -226,6 +349,7 @@ if __name__ == '__main__':
         sys.exit(1)
     
     # 2. Initialize the Angel One Client
+    # This will now also log in AND get the feed_token
     angelone = AngelOneAPIClient(CLIENT_ID, PASSWORD, API_KEY, SECRET_KEY) 
     
     if not angelone.session_generated:
@@ -239,10 +363,35 @@ if __name__ == '__main__':
         print(f"Fatal Error: {e}")
         sys.exit(1)
     
-    # 4. Start monitoring threads
-    # ... (Threads would start here) ...
-    # ... (GUI would run here) ...
+    # 4. --- 🟢 NEW: Start the WebSocket ---
+    if angelone.session_generated:
+        angelone.start_websocket(
+            on_data_callback=my_on_data_callback,
+            on_open_callback=my_on_open_callback
+        )
+    
+    # 5. Start GUI / Main Logic
+    # ... (Your Tkinter GUI .mainloop() would go here) ...
     
     if angelone.session_generated:
-        print("\n🎉 ALL SETUP COMPLETE! The system is now ready to fetch data and trade.")
-        print("Please check for login errors above. If successful, run the full monitoring/GUI code.")
+        print("\n🎉 ALL SETUP COMPLETE! WebSocket is attempting to connect.")
+        print("The system is now ready to receive live data.")
+        print("Press CTRL+C to stop the script.")
+
+    # 6. --- 🟢 NEW: Keep main thread alive ---
+    # This is essential. If your script ends, the background thread dies.
+    # If you are running a Tkinter GUI, its .mainloop() function
+    # does this for you, and you can remove this part.
+    try:
+        while True:
+            # Print current prices every 5 seconds
+            if int(time.time()) % 5 == 0:
+                nifty_price = CURRENT_TRADE_STATE['NIFTY']['index_ltp']
+                bnf_price = CURRENT_TRADE_STATE['BANKNIFTY']['index_ltp']
+                print(f"💹 Current Prices - NIFTY: ₹{nifty_price:,.2f} | BANKNIFTY: ₹{bnf_price:,.2f}")
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+        if angelone.websocket:
+            angelone.websocket.close() # Attempt to close WebSocket gracefully
+        sys.exit(0)
