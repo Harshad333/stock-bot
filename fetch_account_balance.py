@@ -468,6 +468,62 @@ class AngelAccountFetcher:
             print(f"\n❌ [ERROR] Failed to place stop loss order: {e}")
             return False
     
+    def place_stoploss_order_with_id(self, symbol, token, quantity, stoploss_price, trigger_price):
+        """Place stop loss order and return order ID (for trailing SL)"""
+        try:
+            order_params = {
+                "variety": "STOPLOSS",
+                "tradingsymbol": symbol,
+                "symboltoken": token,
+                "transactiontype": "SELL",
+                "exchange": "NFO",
+                "ordertype": "STOPLOSS_LIMIT",
+                "producttype": "INTRADAY",
+                "duration": "DAY",
+                "quantity": str(quantity),
+                "price": str(stoploss_price),
+                "triggerprice": str(trigger_price)
+            }
+            
+            print(f"\n📋 [STOP LOSS ORDER DETAILS]")
+            print(f"   Symbol: {symbol}")
+            print(f"   Type: SELL (Stop Loss)")
+            print(f"   Quantity: {quantity}")
+            print(f"   Stop Loss Price: ₹{stoploss_price:.2f}")
+            print(f"   Trigger Price: ₹{trigger_price:.2f}")
+            
+            # Place order
+            response = self.client.placeOrder(order_params)
+            
+            print(f"\n🔍 [DEBUG] SL Response type: {type(response)}, Value: {response}")
+            
+            # Return order ID if successful
+            if isinstance(response, str) and response and len(response) > 5:
+                print(f"\n✅ [SUCCESS] Stop Loss order placed successfully!")
+                print(f"   Order ID: {response}")
+                return response  # Return order ID
+            
+            if response and isinstance(response, dict) and response.get('status'):
+                data = response.get('data', {})
+                if isinstance(data, dict):
+                    order_id = data.get('orderid')
+                elif isinstance(data, str):
+                    order_id = data
+                else:
+                    order_id = str(data) if data else None
+                
+                if order_id:
+                    print(f"\n✅ [SUCCESS] Stop Loss order placed successfully!")
+                    print(f"   Order ID: {order_id}")
+                    return order_id  # Return order ID
+            
+            print(f"\n❌ [ERROR] Stop Loss order failed: {response}")
+            return None
+                
+        except Exception as e:
+            print(f"\n❌ [ERROR] Failed to place stop loss order: {e}")
+            return None
+    
     def place_target_order(self, symbol, token, quantity, target_price):
         """Place target order (SELL) at specified price"""
         try:
@@ -527,6 +583,190 @@ class AngelAccountFetcher:
         except Exception as e:
             print(f"\n❌ [ERROR] Failed to place target order: {e}")
             return False
+    
+    # =========================================================================
+    # TRAILING STOP LOSS SYSTEM
+    # =========================================================================
+    
+    def get_order_status(self, order_id):
+        """Get status of an order"""
+        try:
+            order_book = self.client.orderBook()
+            
+            if order_book and order_book.get('data'):
+                for order in order_book['data']:
+                    if order.get('orderid') == order_id:
+                        return {
+                            'status': order.get('orderstatus', 'unknown'),
+                            'filled_qty': order.get('filledshares', 0),
+                            'price': order.get('price', 0),
+                            'trigger_price': order.get('triggerprice', 0)
+                        }
+            return None
+        except Exception as e:
+            print(f"❌ [ERROR] Failed to get order status: {e}")
+            return None
+    
+    def modify_stoploss_order(self, order_id, symbol, token, quantity, new_price, new_trigger_price):
+        """Modify existing stop loss order with new price"""
+        try:
+            modify_params = {
+                "variety": "STOPLOSS",
+                "orderid": order_id,
+                "tradingsymbol": symbol,
+                "symboltoken": token,
+                "transactiontype": "SELL",
+                "exchange": "NFO",
+                "ordertype": "STOPLOSS_LIMIT",
+                "producttype": "INTRADAY",
+                "duration": "DAY",
+                "quantity": str(quantity),
+                "price": str(new_price),
+                "triggerprice": str(new_trigger_price)
+            }
+            
+            response = self.client.modifyOrder(modify_params)
+            
+            if isinstance(response, str) and response and len(response) > 5:
+                print(f"✅ SL Modified! New SL: ₹{new_price:.2f} (Trigger: ₹{new_trigger_price:.2f})")
+                return True
+            
+            if response and isinstance(response, dict) and response.get('status'):
+                print(f"✅ SL Modified! New SL: ₹{new_price:.2f} (Trigger: ₹{new_trigger_price:.2f})")
+                return True
+            
+            print(f"⚠️  SL modification failed: {response}")
+            return False
+            
+        except Exception as e:
+            print(f"❌ [ERROR] Failed to modify SL order: {e}")
+            return False
+    
+    def calculate_trailing_sl(self, entry_price, current_price, current_sl):
+        """
+        Calculate new trailing SL based on profit level
+        
+        Rules:
+        - Initial SL: 10% below entry
+        - At 7% profit: Lock 3% profit
+        - Every 5% after 7%: Move SL up 5%
+        """
+        profit_percent = ((current_price - entry_price) / entry_price) * 100
+        
+        # If not yet at 7% profit, keep initial SL (10% below entry)
+        if profit_percent < 7:
+            initial_sl = round(entry_price * 0.90, 2)
+            return initial_sl, False  # (sl_price, should_modify)
+        
+        # At 7% or more profit - calculate trailing SL
+        if profit_percent >= 7:
+            # Calculate how many 5% steps above the 7% threshold
+            steps_above_7 = int((profit_percent - 7) / 5)
+            
+            # Lock profit: 3% at 7%, then +5% for each step
+            locked_profit_percent = 3 + (steps_above_7 * 5)
+            
+            # Calculate new SL price
+            new_sl = round(entry_price * (1 + locked_profit_percent / 100), 2)
+            
+            # Only modify if new SL is higher than current SL
+            if new_sl > current_sl:
+                return new_sl, True
+        
+        return current_sl, False
+    
+    def trailing_stoploss_monitor(self, symbol, token, quantity, entry_price, sl_order_id):
+        """
+        Main trailing stop loss monitoring loop
+        
+        Continuously monitors price and adjusts SL based on profit levels
+        """
+        import time
+        
+        print("\n" + "="*60)
+        print("  🔄 TRAILING STOP LOSS MONITOR STARTED")
+        print("="*60)
+        print(f"\n📊 Entry Price: ₹{entry_price:.2f}")
+        print(f"📋 SL Order ID: {sl_order_id}")
+        
+        # Initial SL (10% below entry)
+        current_sl = round(entry_price * 0.90, 2)
+        print(f"📉 Initial SL: ₹{current_sl:.2f} (10% below entry)")
+        
+        # Trailing milestones
+        print("\n📈 Trailing Milestones:")
+        print(f"   At 7% profit (₹{entry_price * 1.07:.2f}) → Lock 3% (SL = ₹{entry_price * 1.03:.2f})")
+        print(f"   At 12% profit (₹{entry_price * 1.12:.2f}) → Lock 8% (SL = ₹{entry_price * 1.08:.2f})")
+        print(f"   At 17% profit (₹{entry_price * 1.17:.2f}) → Lock 13% (SL = ₹{entry_price * 1.13:.2f})")
+        
+        print("\n" + "-"*60)
+        print("⏳ Monitoring price... (Press Ctrl+C to stop)")
+        print("-"*60)
+        
+        last_profit_milestone = -10  # Track last reported milestone
+        check_interval = 3  # Check every 3 seconds
+        
+        try:
+            while True:
+                # Get current price
+                current_price = self.get_option_ltp(symbol, token)
+                
+                if not current_price:
+                    print("⚠️  Could not fetch price, retrying...")
+                    time.sleep(check_interval)
+                    continue
+                
+                # Calculate profit
+                profit_percent = ((current_price - entry_price) / entry_price) * 100
+                
+                # Check if SL order is filled (exit condition)
+                order_status = self.get_order_status(sl_order_id)
+                if order_status and order_status['status'] in ['complete', 'filled']:
+                    print(f"\n🛑 STOP LOSS HIT!")
+                    print(f"   Exit Price: ₹{order_status.get('price', current_sl):.2f}")
+                    print(f"   P&L: {((current_sl - entry_price) / entry_price) * 100:.1f}%")
+                    break
+                
+                # Calculate new trailing SL
+                new_sl, should_modify = self.calculate_trailing_sl(entry_price, current_price, current_sl)
+                
+                # Print status update at profit milestones (every 2%)
+                current_milestone = int(profit_percent / 2) * 2
+                if current_milestone != last_profit_milestone:
+                    status_icon = "📈" if profit_percent > 0 else "📉"
+                    print(f"{status_icon} LTP: ₹{current_price:.2f} | Profit: {profit_percent:+.1f}% | Current SL: ₹{current_sl:.2f}")
+                    last_profit_milestone = current_milestone
+                
+                # Modify SL if needed
+                if should_modify:
+                    print(f"\n🔄 TRAILING SL ADJUSTMENT!")
+                    print(f"   Profit: {profit_percent:.1f}%")
+                    print(f"   Moving SL: ₹{current_sl:.2f} → ₹{new_sl:.2f}")
+                    
+                    trigger_price = round(new_sl + 0.05, 2)
+                    
+                    success = self.modify_stoploss_order(
+                        sl_order_id, symbol, token, quantity,
+                        new_sl, trigger_price
+                    )
+                    
+                    if success:
+                        current_sl = new_sl
+                        print(f"   New SL locked at ₹{current_sl:.2f}")
+                    
+                    print("-"*60)
+                
+                time.sleep(check_interval)
+                
+        except KeyboardInterrupt:
+            print("\n\n⚠️  Trailing SL monitoring stopped by user")
+            print(f"📊 Final Status:")
+            print(f"   Entry: ₹{entry_price:.2f}")
+            print(f"   Current SL: ₹{current_sl:.2f}")
+            print("="*60)
+        except Exception as e:
+            print(f"\n❌ [ERROR] Trailing monitor error: {e}")
+            print(f"📊 Last known SL: ₹{current_sl:.2f}")
     
     def option_chain_buy(self):
         """Option chain buy logic with user interaction"""
@@ -644,7 +884,7 @@ class AngelAccountFetcher:
         
         # Fixed percentages
         sl_percent = 10  # 10% Stop Loss
-        target_percent = 20  # 20% Target
+        target_percent = 30  # 30% Target
         
         stoploss_price = None
         target_price = None
@@ -687,7 +927,7 @@ class AngelAccountFetcher:
             print(f"   Target: ₹{target_price:.2f} ({target_percent}% above)")
         print("-"*60)
         
-        confirm = input("\n🔔 Confirm order with SL/Target? (yes/no): ").strip().lower()
+        confirm = input("\n🔔 Confirm BUY order? (yes/no): ").strip().lower()
         
         if confirm in ['yes', 'y']:
             print("\n🚀 Placing BUY order...")
@@ -708,6 +948,9 @@ class AngelAccountFetcher:
                 print("\n🔄 Fetching latest market price for SL/Target...")
                 fresh_ltp = self.get_option_ltp(option_contract['symbol'], option_contract['token'])
                 
+                sl_order_id = None
+                entry_price = fresh_ltp if fresh_ltp else option_ltp
+                
                 if fresh_ltp:
                     print(f"📊 Current Market Price: ₹{fresh_ltp:.2f}")
                     
@@ -720,9 +963,9 @@ class AngelAccountFetcher:
                     print(f"      (Trigger at: ₹{fresh_trigger_price:.2f})")
                     print(f"   📈 Target ({target_percent}%): ₹{fresh_target_price:.2f}")
                     
-                    # Place Stop Loss order
+                    # Place Stop Loss order and capture order ID
                     print("\n📉 Placing Stop Loss order...")
-                    sl_success = self.place_stoploss_order(
+                    sl_response = self.place_stoploss_order_with_id(
                         option_contract['symbol'],
                         option_contract['token'],
                         quantity,
@@ -730,7 +973,8 @@ class AngelAccountFetcher:
                         fresh_trigger_price
                     )
                     
-                    if sl_success:
+                    if sl_response:
+                        sl_order_id = sl_response
                         print("✅ Stop Loss order placed!")
                     else:
                         print("⚠️  Stop Loss order failed. Please place manually.")
@@ -750,18 +994,20 @@ class AngelAccountFetcher:
                         print("⚠️  Target order failed. Please place manually.")
                 else:
                     print("⚠️  Could not fetch latest price. Using original calculations...")
+                    entry_price = option_ltp
                     
                     # Fallback to original calculations
                     if stoploss_price and trigger_price:
                         print("\n📉 Placing Stop Loss order...")
-                        sl_success = self.place_stoploss_order(
+                        sl_response = self.place_stoploss_order_with_id(
                             option_contract['symbol'],
                             option_contract['token'],
                             quantity,
                             stoploss_price,
                             trigger_price
                         )
-                        if sl_success:
+                        if sl_response:
+                            sl_order_id = sl_response
                             print("✅ Stop Loss order placed!")
                         else:
                             print("⚠️  Stop Loss order failed. Please place manually.")
@@ -782,6 +1028,24 @@ class AngelAccountFetcher:
                 print("\n" + "="*60)
                 print("📋 ORDER PLACEMENT COMPLETE!")
                 print("="*60)
+                
+                # Auto-enable Trailing SL
+                if sl_order_id:
+                    print("\n" + "-"*60)
+                    print("🔄 AUTO-STARTING TRAILING STOP LOSS")
+                    print("-"*60)
+                    print("Trailing SL will automatically adjust stop loss as price rises.")
+                    print("  - At 7% profit: Lock 3% profit")
+                    print("  - Every 5% rise after: Move SL up 5%")
+                    print("  - Press Ctrl+C to stop monitoring")
+                    
+                    self.trailing_stoploss_monitor(
+                        option_contract['symbol'],
+                        option_contract['token'],
+                        quantity,
+                        entry_price,
+                        sl_order_id
+                    )
             else:
                 print("\n❌ BUY Order failed. Please check your account or try again.")
         else:
