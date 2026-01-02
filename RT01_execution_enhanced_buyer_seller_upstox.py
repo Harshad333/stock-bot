@@ -17,15 +17,24 @@ import json
 import gzip
 import math
 import webbrowser
+import pyotp
 from openpyxl import Workbook, load_workbook
 
 class EnhancedBuyerSellerDetectionUpstox:
     def __init__(self):
-        # Upstox Credentials (from fetch_account_balance_upstox.py)
+        # Upstox Credentials
         self.API_KEY = "43fdf842-a9e1-4f20-9977-b6d1e4c8a9dc"
-        self.API_SECRET = "gs1ge527c7"
+        self.API_SECRET = "gs1ge527c7"  # UPDATE THIS with correct API Secret
         self.REDIRECT_URI = "https://account.upstox.com/developer/apps/createapp"
-        self.ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI0TkNUUFEiLCJqdGkiOiI2OTUyM2Y2NmEyNWJmMTZmNjE1YTg1ODAiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlhdCI6MTc2Njk5Nzg2MiwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxNzY3MDQ1NjAwfQ.Vw7j3I1LtPlX9Zu-_XhHKKe8k06rc8uxj-O_B612CrU"
+        self.ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiJBQzY3MjciLCJqdGkiOiI2OTU3NDJmMzk3ZTk0ZDI3ODZmNDU3Y2QiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlhdCI6MTc2NzMyNjQ1MSwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxNzY3MzkxMjAwfQ.0_4YtlXfYlxgBQvz5MIzsLbwAdqGQoDVx0tAPl5-NbU"
+        
+        # TOTP Auto-Login Credentials (Fill these for auto-login)
+        self.UPSTOX_MOBILE = ""      # Your registered mobile number
+        self.UPSTOX_PIN = ""         # Your 6-digit Upstox PIN
+        self.TOTP_SECRET = ""        # TOTP Secret from Upstox App (Settings -> 2FA)
+        
+        # Token Storage
+        self.TOKEN_FILE = "upstox_token.json"
         
         self.api_client = None
         self.session_generated = False
@@ -54,9 +63,16 @@ class EnhancedBuyerSellerDetectionUpstox:
         self.instrument_df = None
         self.trade_log_file = "RT01_Trade_Log_Upstox.xlsx"
         self.state_file = "RT01_Trade_State_Upstox.json"
+        self.rejected_trades_file = "RT01_Rejected_Trades.csv"  # Rejected trades log
         self.current_trade_row = None
         self.fast_contract_map = {}
         self.option_chain_data = None
+        
+        # LAST TRADE TRACKING (for RSI validation)
+        self.last_trade_type = None  # 'CE' or 'PE'
+        self.last_trade_close_time = None  # datetime when trade closed
+        self.cooling_time_minutes = 5  # 5 minute cooling period
+        self.last_trade_state_file = "RT01_Last_Trade_State.json"  # State persistence file
         
         self.connect()
         
@@ -69,34 +85,51 @@ class EnhancedBuyerSellerDetectionUpstox:
             self.display_funds()
             threading.Thread(target=self.download_instrument_master).start()
             self.sync_state_from_broker()
+            self.sync_last_trade_from_broker()  # Sync last trade info from broker
     
     def connect(self):
-        """Connect to Upstox using OAuth2 Access Token"""
+        """Connect to Upstox - Auto-login with TOTP or saved token"""
         try:
             configuration = upstox_client.Configuration()
             
-            if self.ACCESS_TOKEN and self.ACCESS_TOKEN != "YOUR_ACCESS_TOKEN":
-                configuration.access_token = self.ACCESS_TOKEN
-                self.api_client = upstox_client.ApiClient(configuration)
-                
-                # Verify token by making a test API call
-                try:
-                    api_instance = upstox_client.UserApi(self.api_client)
-                    api_response = api_instance.get_profile(api_version='2.0')
-                    if api_response and api_response.status == 'success':
-                        self.session_generated = True
-                        print("[SUCCESS] Enhanced Detection System (UPSTOX) Connected!")
-                    else:
-                        print("[WARN] Token may be invalid. Will auto-refresh...")
-                        self.session_generated = False
-                except Exception as e:
-                    if "401" in str(e) or "Unauthorized" in str(e):
-                        print("[WARN] Token expired (401). Will auto-refresh...")
-                    else:
-                        print(f"[WARN] Token verification failed: {e}")
+            # Step 1: Try to load saved token from file
+            saved_token = self._load_saved_token()
+            if saved_token:
+                self.ACCESS_TOKEN = saved_token
+            
+            # Step 2: If no token, try TOTP auto-login
+            if not self.ACCESS_TOKEN:
+                print("[CONNECT] No token found, attempting TOTP auto-login...")
+                if self._auto_login_with_totp():
+                    return
+                else:
+                    print("[CONNECT] TOTP login failed, will try manual refresh...")
                     self.session_generated = False
-            else:
-                print("[ERROR] No Access Token provided.")
+                    return
+            
+            # Step 3: Verify token
+            configuration.access_token = self.ACCESS_TOKEN
+            self.api_client = upstox_client.ApiClient(configuration)
+            
+            try:
+                api_instance = upstox_client.UserApi(self.api_client)
+                api_response = api_instance.get_profile(api_version='2.0')
+                if api_response and api_response.status == 'success':
+                    self.session_generated = True
+                    self._save_token(self.ACCESS_TOKEN)  # Save valid token
+                    print("[SUCCESS] Enhanced Detection System (UPSTOX) Connected!")
+                else:
+                    print("[WARN] Token may be invalid. Will try TOTP auto-login...")
+                    if self._auto_login_with_totp():
+                        return
+                    self.session_generated = False
+            except Exception as e:
+                if "401" in str(e) or "Unauthorized" in str(e):
+                    print("[WARN] Token expired (401). Trying TOTP auto-login...")
+                    if self._auto_login_with_totp():
+                        return
+                else:
+                    print(f"[WARN] Token verification failed: {e}")
                 self.session_generated = False
                 
         except Exception as e:
@@ -183,6 +216,183 @@ class EnhancedBuyerSellerDetectionUpstox:
         except Exception as e:
             print(f"\n⚠️ Could not auto-save token: {e}")
             print("   Please manually update ACCESS_TOKEN in the script.")
+
+    def _load_saved_token(self):
+        """Load saved token from file if valid for today"""
+        try:
+            if not os.path.exists(self.TOKEN_FILE):
+                return None
+            
+            with open(self.TOKEN_FILE, 'r') as f:
+                data = json.load(f)
+            
+            # Check if token is from today
+            saved_date = data.get('date', '')
+            today = datetime.datetime.now().strftime('%Y-%m-%d')
+            
+            if saved_date == today and data.get('access_token'):
+                print(f"[TOKEN] Found saved token from today ({today})")
+                return data.get('access_token')
+            else:
+                print(f"[TOKEN] Saved token is from {saved_date}, need fresh login")
+                return None
+                
+        except Exception as e:
+            print(f"[TOKEN] Error loading saved token: {e}")
+            return None
+    
+    def _save_token(self, token):
+        """Save token to file with today's date"""
+        try:
+            data = {
+                'date': datetime.datetime.now().strftime('%Y-%m-%d'),
+                'access_token': token,
+                'saved_at': datetime.datetime.now().isoformat()
+            }
+            with open(self.TOKEN_FILE, 'w') as f:
+                json.dump(data, f, indent=2)
+            print(f"[TOKEN] Saved to {self.TOKEN_FILE}")
+        except Exception as e:
+            print(f"[TOKEN] Error saving token: {e}")
+    
+    def _auto_login_with_totp(self):
+        """
+        Automatic login using TOTP - No manual interaction needed!
+        Requires: UPSTOX_MOBILE, UPSTOX_PIN, TOTP_SECRET
+        """
+        print("\n" + "="*60)
+        print("  🤖 TOTP AUTO-LOGIN")
+        print("="*60)
+        
+        # Check if TOTP credentials are configured
+        if not all([self.UPSTOX_MOBILE, self.UPSTOX_PIN, self.TOTP_SECRET]):
+            print("\n❌ TOTP credentials not configured!")
+            print("   Please fill these in the script:")
+            print("   - UPSTOX_MOBILE: Your registered mobile")
+            print("   - UPSTOX_PIN: Your 6-digit PIN")
+            print("   - TOTP_SECRET: From Upstox App (Settings -> 2FA)")
+            return False
+        
+        try:
+            # Generate TOTP
+            totp = pyotp.TOTP(self.TOTP_SECRET)
+            totp_code = totp.now()
+            print(f"[TOTP] Generated code: {totp_code}")
+            
+            # Step 1: Initiate login
+            print("[LOGIN] Step 1: Initiating login...")
+            session = requests.Session()
+            
+            login_url = "https://api.upstox.com/v2/login/authorization/dialog"
+            params = {
+                "response_type": "code",
+                "client_id": self.API_KEY,
+                "redirect_uri": self.REDIRECT_URI
+            }
+            
+            # Get the login page
+            resp = session.get(login_url, params=params, allow_redirects=True)
+            
+            # Step 2: Submit mobile number
+            print("[LOGIN] Step 2: Submitting mobile number...")
+            mobile_url = "https://api.upstox.com/v2/login/authorization/step1"
+            mobile_data = {
+                "client_id": self.API_KEY,
+                "redirect_uri": self.REDIRECT_URI,
+                "response_type": "code",
+                "mobile_number": self.UPSTOX_MOBILE
+            }
+            
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            }
+            
+            resp = session.post(mobile_url, json=mobile_data, headers=headers)
+            
+            if resp.status_code != 200:
+                # Try alternative endpoint
+                mobile_url_alt = "https://api-v2.upstox.com/login/authorization/step1"
+                resp = session.post(mobile_url_alt, json=mobile_data, headers=headers)
+            
+            # Step 3: Submit PIN + TOTP
+            print("[LOGIN] Step 3: Submitting PIN + TOTP...")
+            otp_url = "https://api.upstox.com/v2/login/authorization/step2"
+            otp_data = {
+                "client_id": self.API_KEY,
+                "redirect_uri": self.REDIRECT_URI,
+                "response_type": "code",
+                "mobile_number": self.UPSTOX_MOBILE,
+                "pin": self.UPSTOX_PIN,
+                "totp": totp_code
+            }
+            
+            resp = session.post(otp_url, json=otp_data, headers=headers, allow_redirects=False)
+            
+            # Check for redirect with code
+            if resp.status_code in [302, 303] or 'code=' in str(resp.headers.get('Location', '')):
+                redirect_url = resp.headers.get('Location', '')
+                if 'code=' in redirect_url:
+                    code = redirect_url.split('code=')[1].split('&')[0]
+                    print(f"[LOGIN] Got authorization code: {code[:20]}...")
+                    
+                    # Exchange code for token
+                    return self._exchange_code_for_token(code)
+            
+            # Try to get code from response
+            if resp.status_code == 200:
+                result = resp.json()
+                if 'code' in result:
+                    return self._exchange_code_for_token(result['code'])
+                elif 'data' in result and 'code' in result.get('data', {}):
+                    return self._exchange_code_for_token(result['data']['code'])
+            
+            print(f"[LOGIN] Response: {resp.status_code} - {resp.text[:200]}")
+            print("\n⚠️ TOTP auto-login failed. Falling back to manual login...")
+            return False
+            
+        except Exception as e:
+            print(f"\n❌ TOTP login error: {e}")
+            return False
+    
+    def _exchange_code_for_token(self, code):
+        """Exchange authorization code for access token"""
+        print("[TOKEN] Exchanging code for access token...")
+        
+        token_url = "https://api.upstox.com/v2/login/authorization/token"
+        headers = {
+            "accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        data = {
+            "code": code,
+            "client_id": self.API_KEY,
+            "client_secret": self.API_SECRET,
+            "redirect_uri": self.REDIRECT_URI,
+            "grant_type": "authorization_code",
+        }
+        
+        try:
+            response = requests.post(token_url, headers=headers, data=data)
+            result = response.json()
+            
+            if "access_token" in result:
+                self.ACCESS_TOKEN = result["access_token"]
+                configuration = upstox_client.Configuration()
+                configuration.access_token = self.ACCESS_TOKEN
+                self.api_client = upstox_client.ApiClient(configuration)
+                self.session_generated = True
+                
+                print("\n✅ Auto-login successful!")
+                self._save_token(self.ACCESS_TOKEN)
+                return True
+            else:
+                print(f"\n❌ Token exchange failed: {result}")
+                return False
+        except Exception as e:
+            print(f"\n❌ Token exchange error: {e}")
+            return False
+
 
     def display_funds(self):
         """Fetch and display account balance - UPSTOX VERSION"""
@@ -296,6 +506,145 @@ class EnhancedBuyerSellerDetectionUpstox:
                 
         except Exception as e:
             print(f"[SYNC ERROR] {e}")
+
+    def sync_last_trade_from_broker(self):
+        """
+        Sync last trade info from broker's trade history (today only)
+        This ensures RSI validation works correctly even after script restart
+        """
+        try:
+            today = datetime.datetime.now().date()
+            print(f"\n[LAST TRADE SYNC] Fetching today's trade history from Upstox...")
+            
+            # First, try to load from saved state file
+            if self._load_last_trade_state():
+                print("[LAST TRADE SYNC] Loaded from saved state file")
+                return
+            
+            # Fetch trade history from broker
+            api_instance = upstox_client.OrderApi(self.api_client)
+            trade_response = api_instance.get_trade_history(api_version='2.0')
+            
+            if not trade_response or trade_response.status != 'success':
+                print("[LAST TRADE SYNC] No trade history available from broker")
+                return
+            
+            trades_data = trade_response.data if trade_response.data else []
+            
+            if not trades_data:
+                print("[LAST TRADE SYNC] No trades found for today")
+                return
+            
+            # Filter NIFTY option trades (CE/PE) that are SELL (exit trades)
+            nifty_exit_trades = []
+            for trade in trades_data:
+                trading_symbol = getattr(trade, 'trading_symbol', '')
+                transaction_type = getattr(trade, 'transaction_type', '')
+                trade_time_str = getattr(trade, 'order_timestamp', '') or getattr(trade, 'exchange_timestamp', '')
+                
+                # Check if it's a NIFTY option and SELL transaction (exit)
+                if 'NIFTY' in trading_symbol and transaction_type == 'SELL':
+                    if 'CE' in trading_symbol or 'PE' in trading_symbol:
+                        try:
+                            # Parse trade time
+                            if trade_time_str:
+                                if isinstance(trade_time_str, str):
+                                    trade_time = datetime.datetime.fromisoformat(trade_time_str.replace('Z', '+00:00'))
+                                else:
+                                    trade_time = trade_time_str
+                                
+                                # Check if it's today's trade
+                                if trade_time.date() == today:
+                                    trade_type = 'CE' if 'CE' in trading_symbol else 'PE'
+                                    nifty_exit_trades.append({
+                                        'symbol': trading_symbol,
+                                        'type': trade_type,
+                                        'time': trade_time,
+                                        'price': float(getattr(trade, 'average_price', 0))
+                                    })
+                        except Exception as e:
+                            print(f"[LAST TRADE SYNC] Error parsing trade: {e}")
+                            continue
+            
+            if not nifty_exit_trades:
+                print("[LAST TRADE SYNC] No NIFTY option exit trades found for today")
+                return
+            
+            # Sort by time descending to get the most recent trade
+            nifty_exit_trades.sort(key=lambda x: x['time'], reverse=True)
+            last_trade = nifty_exit_trades[0]
+            
+            # Set the last trade info
+            self.last_trade_type = last_trade['type']
+            self.last_trade_close_time = last_trade['time']
+            
+            # Remove timezone info for local comparison
+            if self.last_trade_close_time.tzinfo is not None:
+                self.last_trade_close_time = self.last_trade_close_time.replace(tzinfo=None)
+            
+            print(f"[LAST TRADE SYNC] ✅ Found last trade from broker:")
+            print(f"   Type: {self.last_trade_type}")
+            print(f"   Symbol: {last_trade['symbol']}")
+            print(f"   Time: {self.last_trade_close_time.strftime('%H:%M:%S')}")
+            print(f"   Price: ₹{last_trade['price']:.2f}")
+            
+            # Save state to file
+            self._save_last_trade_state()
+            
+        except Exception as e:
+            print(f"[LAST TRADE SYNC ERROR] {e}")
+            print("[LAST TRADE SYNC] Will start fresh without last trade info")
+
+    def _save_last_trade_state(self):
+        """Save last trade state to file for persistence"""
+        try:
+            today = datetime.datetime.now().date().isoformat()
+            state = {
+                'date': today,
+                'last_trade_type': self.last_trade_type,
+                'last_trade_close_time': self.last_trade_close_time.isoformat() if self.last_trade_close_time else None
+            }
+            
+            with open(self.last_trade_state_file, 'w') as f:
+                json.dump(state, f, indent=2)
+            
+            print(f"[STATE SAVED] Last trade state saved to {self.last_trade_state_file}")
+            
+        except Exception as e:
+            print(f"[STATE SAVE ERROR] {e}")
+
+    def _load_last_trade_state(self):
+        """Load last trade state from file (only if same day)"""
+        try:
+            if not os.path.exists(self.last_trade_state_file):
+                return False
+            
+            with open(self.last_trade_state_file, 'r') as f:
+                state = json.load(f)
+            
+            # Check if state is from today
+            today = datetime.datetime.now().date().isoformat()
+            if state.get('date') != today:
+                print(f"[STATE LOAD] State is from {state.get('date')}, not today. Starting fresh.")
+                # Delete old state file
+                os.remove(self.last_trade_state_file)
+                return False
+            
+            # Load state
+            self.last_trade_type = state.get('last_trade_type')
+            close_time_str = state.get('last_trade_close_time')
+            if close_time_str:
+                self.last_trade_close_time = datetime.datetime.fromisoformat(close_time_str)
+            
+            if self.last_trade_type:
+                print(f"[STATE LOADED] Last Trade: {self.last_trade_type} at {self.last_trade_close_time.strftime('%H:%M:%S') if self.last_trade_close_time else 'N/A'}")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            print(f"[STATE LOAD ERROR] {e}")
+            return False
 
     def get_tick_data(self):
         """Get real-time tick data - UPSTOX VERSION (Intraday API)"""
@@ -752,6 +1101,10 @@ class EnhancedBuyerSellerDetectionUpstox:
             
             self.finalize_trade_log(order_id, exit_ltp, reason, pnl)
             
+            # Update last trade tracking (extract CE/PE from symbol)
+            trade_type = 'CE' if 'CE' in symbol else 'PE'
+            self.update_last_trade(trade_type)
+            
             del self.active_positions[order_id]
             
             # Cancel SL order
@@ -792,7 +1145,9 @@ class EnhancedBuyerSellerDetectionUpstox:
             'support_resistance': self.detect_sr_pressure_sensitive(df),
             'price_velocity': self.detect_price_velocity(df),
             'movement_diversion': self.detect_movement_diversion(df),
-            'operator_activity': self.detect_operator_activity(df)
+            'operator_activity': self.detect_operator_activity(df),
+            'consolidation': self.detect_consolidation(df),
+            'trend_strength': self.detect_trend_strength(df)
         }
         
         buyer_score = 0
@@ -870,6 +1225,9 @@ class EnhancedBuyerSellerDetectionUpstox:
             direction = 'BALANCED'
             confidence = max(buyer_score, seller_score) * 100
         
+        # Get consolidation status
+        consolidation = methods['consolidation']
+        
         return {
             'direction': direction,
             'confidence': confidence,
@@ -880,7 +1238,14 @@ class EnhancedBuyerSellerDetectionUpstox:
             'timestamp': latest['timestamp'],
             'price_change_5min': latest['close'] - df['close'].iloc[-6] if len(df) >= 6 else 0,
             'at_peak': current_peak,
-            'at_trough': current_trough
+            'at_trough': current_trough,
+            'is_consolidating': consolidation['is_consolidating'],
+            'market_state': consolidation['market_state'],
+            'atr_percent': consolidation['atr_percent'],
+            'adx_value': methods['trend_strength']['adx_value'],
+            'trend_status': methods['trend_strength']['trend_status'],
+            'trend_direction': methods['trend_strength']['trend_direction'],
+            'is_trending': methods['trend_strength']['is_trending']
         }
     
     def check_immediate_momentum(self, df):
@@ -958,13 +1323,15 @@ class EnhancedBuyerSellerDetectionUpstox:
             return {'direction': 'NEUTRAL', 'confidence': 0.5}
     
     def calculate_enhanced_indicators(self, df):
-        """Calculate enhanced indicators"""
+        """Calculate enhanced indicators including Bollinger Bands and Relative Volatility"""
+        # --- Existing Calculations ---
         df['volume_ma'] = df['volume'].rolling(5).mean()
         df['volume_ratio'] = df['volume'] / df['volume_ma']
         
         df['price_change'] = df['close'].diff()
         df['price_velocity'] = df['price_change'].rolling(2).mean()
         
+        # Peaks and Troughs
         df['is_peak'] = False
         df['is_trough'] = False
         if len(df) >= 3:
@@ -985,7 +1352,478 @@ class EnhancedBuyerSellerDetectionUpstox:
         df['resistance'] = df['high'].rolling(10).max()
         df['support'] = df['low'].rolling(10).min()
         
+        # --- ATR Calculation ---
+        df['tr'] = np.maximum(
+            df['high'] - df['low'],
+            np.maximum(
+                abs(df['high'] - df['close'].shift(1)),
+                abs(df['low'] - df['close'].shift(1))
+            )
+        )
+        df['atr'] = df['tr'].rolling(14).mean()
+        df['atr_percent'] = (df['atr'] / df['close']) * 100
+        
+        # --- NEW: Dynamic ATR (Relative Volatility) ---
+        # Compare current ATR to the average ATR of the last 30 candles
+        df['atr_ma_30'] = df['atr'].rolling(30).mean()
+        df['relative_volatility'] = df['atr'] / df['atr_ma_30']
+        
+        # --- NEW: Bollinger Band Squeeze ---
+        # 20 SMA
+        df['sma_20'] = df['close'].rolling(20).mean()
+        # Standard Deviation
+        df['std_20'] = df['close'].rolling(20).std()
+        df['bb_upper'] = df['sma_20'] + (df['std_20'] * 2)
+        df['bb_lower'] = df['sma_20'] - (df['std_20'] * 2)
+        
+        # Bandwidth %: How wide are the bands relative to price?
+        df['bb_bandwidth'] = ((df['bb_upper'] - df['bb_lower']) / df['sma_20']) * 100
+        
+        # Bandwidth Low (Squeeze detection): Is current bandwidth the lowest in 20 periods?
+        df['bb_squeeze'] = df['bb_bandwidth'] < df['bb_bandwidth'].rolling(20).min().shift(1) + 0.05
+        
+        # --- RSI & ADX (Existing Logic maintained below) ---
+        delta = df['close'].diff()
+        gain = delta.where(delta > 0, 0)
+        loss = (-delta).where(delta < 0, 0)
+        avg_gain = gain.rolling(14).mean()
+        avg_loss = loss.rolling(14).mean()
+        rs = avg_gain / avg_loss
+        df['rsi_14'] = 100 - (100 / (1 + rs))
+        
+        # ADX Calculation
+        df['high_diff'] = df['high'].diff()
+        df['low_diff'] = df['low'].diff().abs() * -1
+        df['plus_dm'] = np.where((df['high_diff'] > 0) & (df['high_diff'] > df['low_diff'].abs()), df['high_diff'], 0)
+        df['minus_dm'] = np.where((df['low_diff'].abs() > 0) & (df['low_diff'].abs() > df['high_diff']), df['low_diff'].abs(), 0)
+        
+        df['smooth_plus_dm'] = df['plus_dm'].rolling(14).sum()
+        df['smooth_minus_dm'] = df['minus_dm'].rolling(14).sum()
+        df['smooth_tr'] = df['tr'].rolling(14).sum()
+        
+        df['plus_di'] = (df['smooth_plus_dm'] / df['smooth_tr']) * 100
+        df['minus_di'] = (df['smooth_minus_dm'] / df['smooth_tr']) * 100
+        df['di_diff'] = abs(df['plus_di'] - df['minus_di'])
+        df['di_sum'] = df['plus_di'] + df['minus_di']
+        df['dx'] = (df['di_diff'] / df['di_sum']) * 100
+        df['adx'] = df['dx'].rolling(14).mean()
+        
         return df
+    
+    def detect_consolidation(self, df, lookback=14):
+        """
+        Detect Consolidation using Hybrid Approach:
+        1. Bollinger Band Squeeze (Primary)
+        2. ADX < 20 (Trend Weakness)
+        3. Relative Volatility (Current ATR vs Historical ATR)
+        4. Tight Box Detection (Price Range)
+        
+        Returns:
+            dict with consolidation status and metrics
+        """
+        try:
+            if df is None or len(df) < 30:  # Increased requirement for BB/ATR_MA
+                return {
+                    'is_consolidating': False,
+                    'atr_percent': 0,
+                    'market_state': 'UNKNOWN',
+                    'consolidation_strength': 0
+                }
+            
+            latest = df.iloc[-1]
+            
+            # 1. Bollinger Band Width Analysis
+            bb_bandwidth = latest.get('bb_bandwidth', 1.0)
+            if pd.isna(bb_bandwidth):
+                bb_bandwidth = 1.0
+            # If bandwidth is very low (e.g., < 0.20% on Nifty is extremely tight)
+            is_bb_squeeze = bb_bandwidth < 0.20
+            
+            # 2. ADX Analysis (Classic Consolidation)
+            adx_value = latest.get('adx', 25)
+            if pd.isna(adx_value):
+                adx_value = 25
+            is_low_adx = adx_value < 20
+            
+            # 3. Relative Volatility (Dynamic ATR)
+            # If current volatility is < 75% of the 30-period average volatility
+            rel_vol = latest.get('relative_volatility', 1.0)
+            if pd.isna(rel_vol):
+                rel_vol = 1.0
+            is_volatility_dropping = rel_vol < 0.75
+            
+            # 4. Price Range (Box Check)
+            recent = df.tail(10)  # check last 10 candles
+            high_range = recent['high'].max()
+            low_range = recent['low'].min()
+            avg_price = recent['close'].mean()
+            range_percent = ((high_range - low_range) / avg_price) * 100 if avg_price > 0 else 0
+            is_tight_box = range_percent < 0.35
+            
+            # --- DECISION LOGIC ---
+            consolidation_score = 0
+            reasons = []
+            
+            if is_bb_squeeze:
+                consolidation_score += 40
+                reasons.append("BB_SQUEEZE")
+            
+            if is_low_adx:
+                consolidation_score += 30
+                reasons.append("LOW_ADX")
+            
+            if is_volatility_dropping:
+                consolidation_score += 20
+                reasons.append("VOL_DROP")
+            
+            if is_tight_box:
+                consolidation_score += 30
+                reasons.append("TIGHT_BOX")
+            
+            # Determine State
+            is_consolidating = False
+            market_state = 'NORMAL_TRENDING'
+            strength = 0.3
+            
+            if consolidation_score >= 50:
+                is_consolidating = True
+                if consolidation_score >= 80:
+                    market_state = 'STRONG_CONSOLIDATION'
+                    strength = 1.0
+                else:
+                    market_state = 'MILD_CONSOLIDATION'
+                    strength = 0.7
+            elif latest.get('atr_percent', 0.5) > 0.40:
+                market_state = 'HIGH_VOLATILITY'
+                strength = 0.0
+            else:
+                market_state = 'NORMAL_TRENDING'
+                strength = 0.3
+            
+            # Get ATR percent for backward compatibility
+            atr_percent = latest.get('atr_percent', 0)
+            if pd.isna(atr_percent):
+                atr_percent = 0
+            
+            return {
+                'is_consolidating': is_consolidating,
+                'atr_percent': round(atr_percent, 4),
+                'range_percent': round(range_percent, 4),
+                'market_state': market_state,
+                'consolidation_strength': round(strength, 2),
+                'atr_value': round(latest.get('atr', 0), 2),
+                'bb_bandwidth': round(bb_bandwidth, 4),
+                'adx': round(adx_value, 2),
+                'consolidation_score': consolidation_score,
+                'reasons': reasons
+            }
+            
+        except Exception as e:
+            print(f"[ERROR] Consolidation detection failed: {e}")
+            return {
+                'is_consolidating': False,
+                'atr_percent': 0,
+                'market_state': 'ERROR',
+                'consolidation_strength': 0
+            }
+    
+    def detect_trend_strength(self, df):
+        """
+        Detect trend strength using ADX indicator
+        
+        ADX Values:
+        0-20:   No trend / Range-bound
+        20-25:  Weak trend forming
+        25-40:  Strong trend
+        40-50:  Very strong trend
+        >50:    Extreme / Exhaustion zone
+        
+        Returns:
+            dict with ADX value, trend status, and direction
+        """
+        try:
+            if df is None or len(df) < 30:
+                return {
+                    'adx_value': 0,
+                    'trend_status': 'UNKNOWN',
+                    'trend_strength': 0,
+                    'trend_direction': 'NEUTRAL',
+                    'plus_di': 0,
+                    'minus_di': 0,
+                    'is_trending': False,
+                    'adx_sustained': False
+                }
+            
+            latest = df.iloc[-1]
+            adx_value = latest.get('adx', 0)
+            plus_di = latest.get('plus_di', 0)
+            minus_di = latest.get('minus_di', 0)
+            
+            if pd.isna(adx_value):
+                adx_value = 0
+            if pd.isna(plus_di):
+                plus_di = 0
+            if pd.isna(minus_di):
+                minus_di = 0
+            
+            # Check if ADX > 25 for last 3 candles (sustained trend)
+            adx_sustained = False
+            if len(df) >= 3:
+                last_3_adx = df['adx'].tail(3).dropna()
+                if len(last_3_adx) >= 3:
+                    adx_sustained = all(adx > 25 for adx in last_3_adx)
+            
+            # Determine trend status based on ADX
+            if adx_value < 20:
+                trend_status = 'NO_TREND'
+                trend_strength = 0
+                is_trending = False
+            elif adx_value < 25:
+                trend_status = 'WEAK_TREND'
+                trend_strength = 0.3
+                is_trending = False
+            elif adx_value < 40:
+                trend_status = 'STRONG_TREND'
+                trend_strength = 0.7
+                is_trending = True
+            elif adx_value < 50:
+                trend_status = 'VERY_STRONG_TREND'
+                trend_strength = 0.9
+                is_trending = True
+            else:
+                trend_status = 'EXTREME_EXHAUSTION'
+                trend_strength = 0.5  # Caution - may reverse
+                is_trending = True
+            
+            # Determine trend direction using +DI and -DI
+            if plus_di > minus_di:
+                trend_direction = 'BULLISH'
+            elif minus_di > plus_di:
+                trend_direction = 'BEARISH'
+            else:
+                trend_direction = 'NEUTRAL'
+            
+            return {
+                'adx_value': round(adx_value, 2),
+                'trend_status': trend_status,
+                'trend_strength': round(trend_strength, 2),
+                'trend_direction': trend_direction,
+                'plus_di': round(plus_di, 2),
+                'minus_di': round(minus_di, 2),
+                'is_trending': is_trending,
+                'adx_sustained': adx_sustained
+            }
+            
+        except Exception as e:
+            print(f"[ERROR] ADX trend detection failed: {e}")
+            return {
+                'adx_value': 0,
+                'trend_status': 'ERROR',
+                'trend_strength': 0,
+                'trend_direction': 'NEUTRAL',
+                'is_trending': False,
+                'adx_sustained': False
+            }
+    
+    def validate_trade_with_rsi(self, new_signal_type, df, is_consolidating):
+        """
+        Validate trade based on RSI rules:
+        
+        Rules:
+        1. Same Side Trade (CE→CE or PE→PE) in Normal Market:
+           - RSI confirmation REQUIRED
+           - CE: RSI > 50, PE: RSI < 50
+        
+        2. Same Side Trade after Consolidation + 5 min cooling:
+           - RSI confirmation NOT required
+        
+        3. Opposite Side Trade (CE→PE or PE→CE):
+           - RSI confirmation NOT required
+        
+        Returns:
+            dict with validation result and details
+        """
+        try:
+            # Get current RSI
+            latest = df.iloc[-1]
+            current_rsi = latest.get('rsi_14', 50)  # Default to 50 if not available
+            
+            if pd.isna(current_rsi):
+                current_rsi = 50
+            
+            current_time = datetime.datetime.now()
+            
+            # Determine if this is first trade (no last trade)
+            if self.last_trade_type is None:
+                return {
+                    'is_valid': True,
+                    'reason': 'FIRST_TRADE',
+                    'rsi_value': round(current_rsi, 2),
+                    'rsi_required': False,
+                    'last_trade_type': None,
+                    'new_signal_type': new_signal_type
+                }
+            
+            # Rule 3: Opposite Side Trade - NO RSI needed
+            if self.last_trade_type != new_signal_type:
+                return {
+                    'is_valid': True,
+                    'reason': 'OPPOSITE_SIDE_TRADE',
+                    'rsi_value': round(current_rsi, 2),
+                    'rsi_required': False,
+                    'last_trade_type': self.last_trade_type,
+                    'new_signal_type': new_signal_type
+                }
+            
+            # Same Side Trade (CE→CE or PE→PE)
+            # Check Rule 2: Consolidation + 5 min cooling
+            if is_consolidating and self.last_trade_close_time is not None:
+                time_since_last_trade = (current_time - self.last_trade_close_time).total_seconds() / 60
+                
+                if time_since_last_trade >= self.cooling_time_minutes:
+                    return {
+                        'is_valid': True,
+                        'reason': 'CONSOLIDATION_COOLING_COMPLETE',
+                        'rsi_value': round(current_rsi, 2),
+                        'rsi_required': False,
+                        'last_trade_type': self.last_trade_type,
+                        'new_signal_type': new_signal_type,
+                        'cooling_time_passed': round(time_since_last_trade, 1)
+                    }
+            
+            # Rule 1: Same Side Trade in Normal Market - RSI confirmation REQUIRED
+            if new_signal_type == 'CE':
+                rsi_condition_met = current_rsi > 50
+                required_condition = 'RSI > 50'
+            else:  # PE
+                rsi_condition_met = current_rsi < 50
+                required_condition = 'RSI < 50'
+            
+            if rsi_condition_met:
+                return {
+                    'is_valid': True,
+                    'reason': 'RSI_CONFIRMED',
+                    'rsi_value': round(current_rsi, 2),
+                    'rsi_required': True,
+                    'rsi_condition': required_condition,
+                    'last_trade_type': self.last_trade_type,
+                    'new_signal_type': new_signal_type
+                }
+            else:
+                return {
+                    'is_valid': False,
+                    'reason': 'RSI_NOT_CONFIRMED',
+                    'rsi_value': round(current_rsi, 2),
+                    'rsi_required': True,
+                    'rsi_condition': required_condition,
+                    'last_trade_type': self.last_trade_type,
+                    'new_signal_type': new_signal_type
+                }
+                
+        except Exception as e:
+            print(f"[ERROR] RSI validation failed: {e}")
+            return {
+                'is_valid': True,
+                'reason': 'VALIDATION_ERROR',
+                'rsi_value': 0,
+                'rsi_required': False
+            }
+    
+    def update_last_trade(self, trade_type):
+        """Update last trade info when a trade closes"""
+        self.last_trade_type = trade_type  # 'CE' or 'PE'
+        self.last_trade_close_time = datetime.datetime.now()
+        print(f"[TRADE TRACKER] Last trade updated: {trade_type} at {self.last_trade_close_time.strftime('%H:%M:%S')}")
+        
+        # Save to file for persistence
+        self._save_last_trade_state()
+    
+    def validate_adx_rsi_combo(self, df, signal_type):
+        """
+        ADX + RSI Combo Validation for trade entry
+        
+        Rules:
+        1. ADX must be above 25 for at least 3 candles (sustained trend)
+        2. RSI should not be above 70 (overbought) or below 30 (oversold) at entry
+        
+        Args:
+            df: DataFrame with calculated indicators
+            signal_type: 'CE' or 'PE'
+        
+        Returns:
+            dict with validation result and details
+        """
+        try:
+            if df is None or len(df) < 3:
+                return {
+                    'is_valid': False,
+                    'reason': 'INSUFFICIENT_DATA',
+                    'adx_valid': False,
+                    'rsi_valid': False,
+                    'adx_value': 0,
+                    'rsi_value': 0
+                }
+            
+            latest = df.iloc[-1]
+            
+            # Get ADX value and sustained check
+            adx_value = latest.get('adx', 0)
+            if pd.isna(adx_value):
+                adx_value = 0
+            
+            # Check ADX sustained above 25 for 3 candles
+            adx_sustained = False
+            last_3_adx = df['adx'].tail(3).dropna()
+            if len(last_3_adx) >= 3:
+                adx_sustained = all(adx > 25 for adx in last_3_adx)
+            
+            # Get RSI value
+            rsi_value = latest.get('rsi_14', 50)
+            if pd.isna(rsi_value):
+                rsi_value = 50
+            
+            # Check RSI not in extreme zones (30-70 range is valid)
+            rsi_valid = 30 <= rsi_value <= 70
+            rsi_zone = 'NORMAL'
+            if rsi_value > 70:
+                rsi_zone = 'OVERBOUGHT'
+            elif rsi_value < 30:
+                rsi_zone = 'OVERSOLD'
+            
+            # Both conditions must pass
+            is_valid = adx_sustained and rsi_valid
+            
+            # Determine reason
+            if is_valid:
+                reason = 'ADX_RSI_VALID'
+            elif not adx_sustained and not rsi_valid:
+                reason = 'ADX_NOT_SUSTAINED_AND_RSI_EXTREME'
+            elif not adx_sustained:
+                reason = 'ADX_NOT_SUSTAINED_3_CANDLES'
+            else:
+                reason = f'RSI_{rsi_zone}'
+            
+            return {
+                'is_valid': is_valid,
+                'reason': reason,
+                'adx_valid': adx_sustained,
+                'rsi_valid': rsi_valid,
+                'adx_value': round(adx_value, 2),
+                'rsi_value': round(rsi_value, 2),
+                'rsi_zone': rsi_zone,
+                'adx_last_3': [round(x, 2) for x in last_3_adx.tolist()] if len(last_3_adx) >= 3 else []
+            }
+            
+        except Exception as e:
+            print(f"[ERROR] ADX+RSI validation failed: {e}")
+            return {
+                'is_valid': False,
+                'reason': 'VALIDATION_ERROR',
+                'adx_valid': False,
+                'rsi_valid': False,
+                'adx_value': 0,
+                'rsi_value': 0
+            }
     
     def detect_volume_price_trend_sensitive(self, df):
         """Volume-Price Trend Analysis"""
@@ -1294,6 +2132,8 @@ class EnhancedBuyerSellerDetectionUpstox:
         Phase 3 (30%+): 28% lock, then +2% every 2% step (SUPER TIGHT)
         """
         try:
+            if entry_price <= 0:
+                return current_sl, False
             profit_percent = ((current_price - entry_price) / entry_price) * 100
             
             # If not yet at 7% profit, keep initial SL
@@ -1414,11 +2254,16 @@ class EnhancedBuyerSellerDetectionUpstox:
             entry_price = position['entry_price']
             target_price = position['target_price']
             
+            # Skip invalid positions (entry_price = 0)
+            if entry_price <= 0:
+                print(f"  [SKIP] {symbol}: Invalid entry price ({entry_price})")
+                continue
+            
             current_ltp = self.get_option_ltp(symbol, token)
             
             if current_ltp:
                 pnl = (current_ltp - entry_price) * position['quantity']
-                pnl_percent = ((current_ltp - entry_price) / entry_price) * 100
+                pnl_percent = ((current_ltp - entry_price) / entry_price) * 100 if entry_price > 0 else 0
                 
                 print(f"  {symbol}: ₹{current_ltp:.1f} | P&L: ₹{pnl:+.0f} ({pnl_percent:+.1f}%) | SL: {position['sl_price']:.1f}")
                 
@@ -1468,6 +2313,35 @@ class EnhancedBuyerSellerDetectionUpstox:
     # TRADE LOGGING
     # =========================================================================
     
+    def log_rejected_trade(self, reason, details):
+        """Log rejected potential trades to CSV"""
+        try:
+            timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Create file/header if not exists
+            if not os.path.exists(self.rejected_trades_file):
+                with open(self.rejected_trades_file, 'w') as f:
+                    f.write("Timestamp,Reason,Score,Direction,Signal_Type,Velocity,RSI,ADX,Details\n")
+            
+            # Prepare data
+            score = details.get('score', 0)
+            direction = details.get('direction', 'UNKNOWN')
+            signal_type = details.get('signal_type', 'N/A')
+            velocity = details.get('velocity', 'N/A')
+            rsi = details.get('rsi', 'N/A')
+            adx = details.get('adx', 'N/A')
+            extra_details = str(details).replace(',', ';') # Avoid CSV conflict
+            
+            log_entry = f"{timestamp},{reason},{score},{direction},{signal_type},{velocity},{rsi},{adx},{extra_details}\n"
+            
+            with open(self.rejected_trades_file, 'a') as f:
+                f.write(log_entry)
+                
+            print(f"[LOG] Rejected trade logged: {reason}")
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to log rejected trade: {e}")
+
     def log_trade_to_excel(self, order_id, position):
         """Log trade to Excel"""
         try:
@@ -1641,12 +2515,49 @@ class EnhancedBuyerSellerDetectionUpstox:
     # TRADE SCORING & RECOMMENDATIONS
     # =========================================================================
     
-    def calculate_trade_score(self, result, trend_filter):
-        """Calculate 100-point trade score"""
+    def calculate_trade_score(self, result, trend_filter, df_check=None):
+        """
+        Calculate Trade Score with Dynamic Weighting for Index (Zero Volume)
+        """
         try:
             score_breakdown = {}
             total_score = 0
             
+            # 1. Determine if we have valid volume data
+            # If volume is 0 or missing, we must redistribute those 28 points
+            has_volume = False
+            if df_check is not None and not df_check.empty:
+                if df_check['volume'].sum() > 0:
+                    has_volume = True
+            
+            # Define Weights based on Data Availability
+            if has_volume:
+                # Original Weights (Total 100)
+                w_velocity = 40
+                w_dominance = 15
+                w_trend = 15
+                w_candle = 10
+                w_timing = 7
+                # Volume Specific
+                w_diversion = 10
+                w_operator = 10
+                w_vol_mom = 8
+            else:
+                # Re-weighted for Price Action Only (Total 100)
+                # Redistributed 28 volume points to Velocity, Trend, and Dominance
+                w_velocity = 55  # +15 boost
+                w_dominance = 20 # +5 boost
+                w_trend = 18     # +3 boost
+                w_candle = 15    # +5 boost
+                w_timing = 7     # Unchanged
+                # Volume Specific (Disabled)
+                w_diversion = 0
+                w_operator = 0
+                w_vol_mom = 0
+                
+                print(f"\n[⚠️ WARNING] Zero Volume Detected (Index?). Re-weighting score for Price Action only.")
+
+            # --- DIRECTION LOGIC ---
             if result['buyer_score'] > result['seller_score']:
                 dominant_score = result['buyer_score']
                 signal_direction = 'BUY'
@@ -1654,75 +2565,150 @@ class EnhancedBuyerSellerDetectionUpstox:
                 dominant_score = result['seller_score']
                 signal_direction = 'SELL'
             
-            # Price Velocity (40 points)
+            # 1. Price Velocity
             price_velocity_data = result['methods'].get('price_velocity', {'confidence': 0})
             price_velocity = price_velocity_data['confidence']
-            velocity_score = 40 if price_velocity > 0.65 else 0
+            velocity_score = w_velocity if price_velocity > 0.65 else 0
             score_breakdown['Price Velocity (>0.65)'] = {
                 'current': price_velocity, 'required': 0.65,
-                'percentage': velocity_score, 'achieved': price_velocity > 0.65
+                'percentage': velocity_score, 'achieved': price_velocity > 0.65,
+                'max_points': w_velocity
             }
             total_score += velocity_score
             
-            # Dominance (15 points)
-            dominance_score = 15 if dominant_score > 0.13 else 0
+            # 2. Dominance
+            dominance_score = w_dominance if dominant_score > 0.13 else 0
             score_breakdown['Buyer/Seller Dominance (>0.13)'] = {
                 'current': dominant_score, 'required': 0.13,
-                'percentage': dominance_score, 'achieved': dominant_score > 0.13
+                'percentage': dominance_score, 'achieved': dominant_score > 0.13,
+                'max_points': w_dominance
             }
             total_score += dominance_score
             
-            # Candle (10 points)
+            # 3. Candle Analysis
             candle_data = result['methods'].get('candle_body_analysis', {'confidence': 0.5, 'direction': 'NEUTRAL'})
             candle_confidence = candle_data['confidence']
-            candle_score = 10 if (candle_confidence > 0.6 and candle_data['direction'] != 'NEUTRAL') else 0
+            candle_score = w_candle if (candle_confidence > 0.6 and candle_data['direction'] != 'NEUTRAL') else 0
             score_breakdown['Candle Body Analysis (>0.6)'] = {
                 'current': candle_confidence, 'required': 0.6,
-                'percentage': candle_score, 'achieved': candle_confidence > 0.6
+                'percentage': candle_score, 'achieved': candle_confidence > 0.6,
+                'max_points': w_candle
             }
             total_score += candle_score
             
-            # Diversion (10 points)
-            diversion_data = result['methods'].get('movement_diversion', {'confidence': 0.5, 'type': 'NO_DIVERGENCE'})
-            diversion_type = diversion_data.get('type', 'NO_DIVERGENCE')
-            diversion_confidence = diversion_data['confidence']
-            diversion_score = 10 if ('DIVERGENCE' in diversion_type and diversion_confidence > 0.65) else 0
-            score_breakdown['Movement Diversion'] = {
-                'current': diversion_confidence, 'required': 0.65,
-                'percentage': diversion_score, 'achieved': 'DIVERGENCE' in diversion_type
-            }
-            total_score += diversion_score
+            # --- VOLUME BASED INDICATORS (Only if has_volume) ---
+            if has_volume:
+                # Movement Diversion
+                div_data = result['methods'].get('movement_diversion', {'confidence': 0.5, 'type': 'NONE'})
+                div_confidence = div_data.get('confidence', 0.5)
+                div_type = div_data.get('type', 'NONE')
+                div_score = w_diversion if ('DIVERGENCE' in div_type and div_confidence > 0.65) else 0
+                score_breakdown['Movement Diversion'] = {
+                    'current': div_confidence, 'required': 0.65,
+                    'percentage': div_score, 'achieved': div_score > 0,
+                    'max_points': w_diversion
+                }
+                total_score += div_score
+
+                # Operator Activity
+                op_data = result['methods'].get('operator_activity', {'operator_score': 0, 'confidence': 0})
+                op_score_val = op_data.get('operator_score', 0)
+                op_confidence = op_data.get('confidence', 0)
+                op_score = w_operator if (op_score_val > 0.6 or op_confidence > 0.6) else 0
+                score_breakdown['Operator Activity'] = {
+                    'current': max(op_score_val, op_confidence), 'required': 0.6,
+                    'percentage': op_score, 'achieved': op_score > 0,
+                    'max_points': w_operator
+                }
+                total_score += op_score
+
+                # Volume Momentum
+                vol_data = result['methods'].get('volume_price_trend', {'confidence': 0.5, 'direction': 'NEUTRAL'})
+                vol_confidence = vol_data.get('confidence', 0.5)
+                vol_direction = vol_data.get('direction', 'NEUTRAL')
+                vol_score = w_vol_mom if (vol_confidence > 0.55 and vol_direction != 'NEUTRAL') else 0
+                score_breakdown['Volume Momentum'] = {
+                    'current': vol_confidence, 'required': 0.55,
+                    'percentage': vol_score, 'achieved': vol_score > 0,
+                    'max_points': w_vol_mom
+                }
+                total_score += vol_score
             
-            # Operator (10 points)
-            operator_data = result['methods'].get('operator_activity', {'operator_score': 0, 'direction': 'NEUTRAL'})
-            operator_score_raw = operator_data.get('operator_score', 0)
-            operator_score = 10 if (operator_score_raw > 0.6 and operator_data['direction'] != 'NEUTRAL') else 0
-            score_breakdown['Operator Activity'] = {
-                'current': operator_score_raw, 'required': 0.6,
-                'percentage': operator_score, 'achieved': operator_score_raw > 0.6
-            }
-            total_score += operator_score
-            
-            # Volume (8 points)
-            volume_data = result['methods'].get('volume_price_trend', {'confidence': 0.5, 'direction': 'NEUTRAL'})
-            volume_confidence = volume_data['confidence']
-            volume_score = 8 if (volume_confidence > 0.55 and volume_data['direction'] != 'NEUTRAL') else 0
-            score_breakdown['Volume Momentum'] = {
-                'current': volume_confidence, 'required': 0.55,
-                'percentage': volume_score, 'achieved': volume_confidence > 0.55
-            }
-            total_score += volume_score
-            
-            # Timing (7 points)
+            # 4. Market Timing
             current_time = datetime.datetime.now()
             market_hour = current_time.hour
             prime_time = (9 <= market_hour < 11) or (13 <= market_hour < 15)
-            timing_score = 7 if prime_time else 0
+            timing_score = w_timing if prime_time else 0
             score_breakdown['Market Timing'] = {
-                'current': market_hour, 'required': 10,
-                'percentage': timing_score, 'achieved': prime_time
+                'current': market_hour, 'required': 10, 
+                'percentage': timing_score, 'achieved': prime_time,
+                'max_points': w_timing
             }
             total_score += timing_score
+            
+            # 5. Consolidation Penalty (-20 points if consolidating)
+            consolidation_data = result['methods'].get('consolidation', {'is_consolidating': False, 'market_state': 'UNKNOWN'})
+            is_consolidating = consolidation_data.get('is_consolidating', False)
+            market_state = consolidation_data.get('market_state', 'UNKNOWN')
+            atr_percent = consolidation_data.get('atr_percent', 0)
+            consol_score = consolidation_data.get('consolidation_score', 0)
+            consol_reasons = consolidation_data.get('reasons', [])
+            bb_bandwidth = consolidation_data.get('bb_bandwidth', 0)
+            consolidation_penalty = -20 if is_consolidating else 0
+            
+            # Build display value showing new multi-factor score
+            if is_consolidating:
+                display_value = f"Score:{consol_score}/100 [{', '.join(consol_reasons)}]"
+            else:
+                display_value = f"ATR:{atr_percent:.2f}% BB:{bb_bandwidth:.2f}%"
+            
+            score_breakdown['Consolidation Detection'] = {
+                'current': atr_percent, 'required': 0.25,
+                'percentage': consolidation_penalty, 'achieved': not is_consolidating,
+                'market_state': market_state,
+                'consolidation_score': consol_score,
+                'bb_bandwidth': bb_bandwidth,
+                'reasons': ', '.join(consol_reasons) if consol_reasons else 'NONE',
+                'display_value': display_value,
+                'max_points': 0  # Penalty only
+            }
+            total_score += consolidation_penalty
+            
+            # 6. ADX Trend Strength
+            trend_data = result['methods'].get('trend_strength', {'adx_value': 0, 'trend_status': 'UNKNOWN', 'is_trending': False, 'trend_direction': 'NEUTRAL'})
+            adx_value = trend_data.get('adx_value', 0)
+            trend_status = trend_data.get('trend_status', 'UNKNOWN')
+            is_trending = trend_data.get('is_trending', False)
+            trend_direction = trend_data.get('trend_direction', 'NEUTRAL')
+            
+            # Check if trend direction matches signal direction
+            trend_matches_signal = False
+            if signal_direction == 'BUY' and trend_direction == 'BULLISH':
+                trend_matches_signal = True
+            elif signal_direction == 'SELL' and trend_direction == 'BEARISH':
+                trend_matches_signal = True
+            
+            # Calculate ADX score
+            if is_trending and trend_matches_signal:
+                adx_score = w_trend  # Bonus for trending in same direction
+            elif is_trending and not trend_matches_signal:
+                adx_score = -5  # Penalty for counter-trend trade
+            elif adx_value < 20:
+                adx_score = -10  # No trend = risky
+            else:
+                adx_score = 0  # Weak trend = neutral
+            
+            score_breakdown['ADX Trend (>25)'] = {
+                'current': adx_value, 'required': 25,
+                'percentage': adx_score, 'achieved': is_trending and trend_matches_signal,
+                'trend_status': trend_status,
+                'trend_direction': trend_direction,
+                'max_points': w_trend
+            }
+            total_score += adx_score
+            
+            # Final Cap
+            total_score = max(total_score, 0)
             
             if total_score >= 80:
                 signal = 'STRONG_TRADE'
@@ -1872,13 +2858,17 @@ class EnhancedBuyerSellerDetectionUpstox:
                     }
                     
                     for method, data in result['methods'].items():
-                        weight = weights.get(method, 0)
-                        contribution = data['confidence'] * weight if data['direction'] != 'NEUTRAL' else 0
+                        # Skip methods with different structure
+                        if method in ['consolidation', 'trend_strength']:
+                            continue
                         
-                        if data['direction'] == 'BUYERS':
+                        weight = weights.get(method, 0)
+                        contribution = data.get('confidence', 0) * weight if data.get('direction', 'NEUTRAL') != 'NEUTRAL' else 0
+                        
+                        if data.get('direction') == 'BUYERS':
                             total_buyer_contribution += contribution
                             indicator = "🟢 BUYERS"
-                        elif data['direction'] == 'SELLERS':
+                        elif data.get('direction') == 'SELLERS':
                             total_seller_contribution += contribution
                             indicator = "🔴 SELLERS"
                         else:
@@ -1890,7 +2880,7 @@ class EnhancedBuyerSellerDetectionUpstox:
                         elif method == 'operator_activity' and 'signals' in data:
                             extra = f" - {', '.join(data['signals']) if data['signals'] else 'NONE'}"
                         
-                        print(f"  {method}: {indicator} ({data['confidence']:.2f}) Weight:{weight:.0%} Contrib:{contribution:.3f}{extra}")
+                        print(f"  {method}: {indicator} ({data.get('confidence', 0):.2f}) Weight:{weight:.0%} Contrib:{contribution:.3f}{extra}")
                     
                     # Dominance Summary
                     if total_buyer_contribution > total_seller_contribution:
@@ -1908,13 +2898,39 @@ class EnhancedBuyerSellerDetectionUpstox:
                     print(f"Actual Seller Score: {result['seller_score']:.3f}")
                     
                     # Trade Scoring System
-                    trade_score = self.calculate_trade_score(result, trend_filter)
+                    trade_score = self.calculate_trade_score(result, trend_filter, df)
                     
                     print(f"\n[TRADE SCORING SYSTEM]")
-                    print("=" * 50)
+                    print("=" * 105)
+                    print(f"| {'COMPONENT':<35} | {'STATUS':<8} | {'VALUE':<12} | {'SCORE':<8} | {'MAX PTS':<8} | {'CONTRIB':<8} |")
+                    print("|" + "-" * 103 + "|")
+                    
                     for category, score_data in trade_score['breakdown'].items():
-                        status = "[PASS]" if score_data['achieved'] else "[FAIL]"
-                        print(f"{status} {category}: {score_data['current']:.1f}/{score_data['required']:.1f} ({score_data['percentage']:.1f}%)")
+                        status = "PASS" if score_data['achieved'] else "FAIL"
+                        status_icon = "✅" if score_data['achieved'] else "❌"
+                        
+                        current = score_data['current']
+                        required = score_data['required']
+                        
+                        # Handle value display
+                        if category == 'Consolidation (ATR)':
+                             value_display = f"{current:.1f}% (<0.25)"
+                        elif category == 'Market Timing':
+                             value_display = f"{current:.0f}h"
+                        else:
+                             value_display = f"{current:.2f} (>{required})"
+
+                        points = score_data['percentage']
+                        max_points = score_data.get('max_points', 0)
+                        
+                        # Handle Max Points for penalty
+                        max_pts_display = str(max_points)
+                        if max_points == 0 and points < 0:
+                             max_pts_display = "0 (PEN)"
+                        
+                        print(f"| {category:<35} | {status_icon} {status:<4} | {value_display:<12} | {points:>6.1f}   | {max_pts_display:<8} | {points:>7.1f}% |")
+                    
+                    print("=" * 105)
                     
                     print(f"\nTOTAL TRADE SCORE: {trade_score['total_score']:.1f}/100 ({trade_score['total_score']:.1f}%)")
                     print(f"TRADE THRESHOLD: 65/100 (65%) for signal generation")
@@ -1935,15 +2951,101 @@ class EnhancedBuyerSellerDetectionUpstox:
                         self.print_quick_alert(alert_direction, result['current_price'])
                         
                         if len(self.active_positions) == 0:
+                            # Determine signal type (CE or PE)
                             if velocity_direction == 'BUYERS' and velocity_confidence > 0.5:
-                                print(f"[AUTO TRADE] BUYERS Velocity ({velocity_confidence:.2f}) → BUY CALL (CE)")
-                                self.execute_trade('BUY', trade_score['total_score'], result['current_price'])
+                                new_signal_type = 'CE'
                             elif velocity_direction == 'SELLERS' and velocity_confidence > 0.5:
-                                print(f"[AUTO TRADE] SELLERS Velocity ({velocity_confidence:.2f}) → BUY PUT (PE)")
-                                self.execute_trade('SELL', trade_score['total_score'], result['current_price'])
+                                new_signal_type = 'PE'
+                            else:
+                                new_signal_type = None
+                            
+                            if new_signal_type:
+                                # RSI Validation - Check if trade is valid
+                                is_consolidating = result.get('is_consolidating', False)
+                                rsi_validation = self.validate_trade_with_rsi(new_signal_type, df, is_consolidating)
+                                
+                                # Print RSI Validation Results
+                                print(f"\n[RSI VALIDATION]")
+                                print("=" * 50)
+                                print(f"Last Trade: {rsi_validation.get('last_trade_type', 'None')}")
+                                print(f"New Signal: {rsi_validation.get('new_signal_type', new_signal_type)}")
+                                print(f"RSI Value: {rsi_validation.get('rsi_value', 0)}")
+                                print(f"RSI Required: {'Yes' if rsi_validation.get('rsi_required', False) else 'No'}")
+                                print(f"Validation: {rsi_validation.get('reason', 'UNKNOWN')}")
+                                print(f"Trade Valid: {'✅ YES' if rsi_validation.get('is_valid', False) else '❌ NO'}")
+                                
+                                # ADX + RSI Combo Validation
+                                adx_rsi_validation = self.validate_adx_rsi_combo(df, new_signal_type)
+                                
+                                print(f"\n[ADX + RSI COMBO VALIDATION]")
+                                print("=" * 50)
+                                print(f"ADX Value: {adx_rsi_validation.get('adx_value', 0)}")
+                                print(f"ADX Last 3 Candles: {adx_rsi_validation.get('adx_last_3', [])}")
+                                print(f"ADX Sustained (>25 for 3 candles): {'✅ YES' if adx_rsi_validation.get('adx_valid', False) else '❌ NO'}")
+                                print(f"RSI Value: {adx_rsi_validation.get('rsi_value', 0)}")
+                                print(f"RSI Zone: {adx_rsi_validation.get('rsi_zone', 'UNKNOWN')}")
+                                print(f"RSI Valid (30-70 range): {'✅ YES' if adx_rsi_validation.get('rsi_valid', False) else '❌ NO'}")
+                                print(f"Combo Valid: {'✅ YES' if adx_rsi_validation.get('is_valid', False) else '❌ NO'}")
+                                
+                                # Both validations must pass
+                                if rsi_validation.get('is_valid', False) and adx_rsi_validation.get('is_valid', False):
+                                    # Trade is valid - Execute
+                                    if new_signal_type == 'CE':
+                                        print(f"\n[AUTO TRADE] BUYERS Velocity ({velocity_confidence:.2f}) → BUY CALL (CE)")
+                                        self.execute_trade('BUY', trade_score['total_score'], result['current_price'])
+                                    else:
+                                        print(f"\n[AUTO TRADE] SELLERS Velocity ({velocity_confidence:.2f}) → BUY PUT (PE)")
+                                        self.execute_trade('SELL', trade_score['total_score'], result['current_price'])
+                                else:
+                                    # Trade rejected
+                                    reason_msg = "VALIDATION_FAILED"
+                                    print(f"\n[TRADE BLOCKED] Validation Failed!")
+                                    if not rsi_validation.get('is_valid', False):
+                                        reason_msg = rsi_validation.get('reason', 'RSI_INVALID')
+                                        print(f"   ❌ RSI Validation Failed: {rsi_validation.get('reason', 'UNKNOWN')}")
+                                    
+                                    if not adx_rsi_validation.get('is_valid', False):
+                                        # Update reason if ADX also failed or is the primary failure
+                                        if reason_msg == "VALIDATION_FAILED" or "RSI" not in reason_msg:
+                                            reason_msg = adx_rsi_validation.get('reason', 'ADX_RSI_COMBO_FAILED')
+                                        else:
+                                            reason_msg += f" | {adx_rsi_validation.get('reason', 'ADX_RSI_COMBO_FAILED')}"
+                                        print(f"   ❌ ADX+RSI Combo Failed: {adx_rsi_validation.get('reason', 'UNKNOWN')}")
+                                    
+                                    # LOG REJECTED TRADE
+                                    details = {
+                                        'score': trade_score['total_score'],
+                                        'direction': result['direction'],
+                                        'signal_type': new_signal_type,
+                                        'velocity': velocity_confidence,
+                                        'rsi': rsi_validation.get('rsi_value', 0),
+                                        'adx': adx_rsi_validation.get('adx_value', 0)
+                                    }
+                                    self.log_rejected_trade(f"BLOCK_{reason_msg}", details)
+
                             else:
                                 print(f"[NO TRADE] Velocity conditions not met: {velocity_direction} ({velocity_confidence:.2f})")
                                 print(f"  Need: BUYERS or SELLERS with confidence > 0.5")
+                                # LOG REJECTED TRADE
+                                # LOG REJECTED TRADE
+                                # Calculate extra stats
+                                try:
+                                    current_rsi = df.iloc[-1].get('rsi_14', 0) if not df.empty else 0
+                                    current_adx = df.iloc[-1].get('adx', 0) if not df.empty else 0
+                                except:
+                                    current_rsi = 0
+                                    current_adx = 0
+
+                                details = {
+                                    'score': trade_score['total_score'],
+                                    'direction': result['direction'],
+                                    'velocity_direction': velocity_direction,
+                                    'velocity': velocity_confidence,
+                                    'signal_type': 'N/A', # Velocity condition failed, so no signal type
+                                    'rsi': current_rsi,
+                                    'adx': current_adx
+                                }
+                                self.log_rejected_trade("BLOCK_VELOCITY_NEUTRAL", details)
                         else:
                             print(f"\n[AUTO TRADE SKIPPED] Position already active")
                         
@@ -1951,6 +3053,45 @@ class EnhancedBuyerSellerDetectionUpstox:
                     else:
                         print(f"\n[TRADE REJECTED] Score: {trade_score['total_score']:.1f}/100 ({trade_score['total_score']:.1f}%) - Need 65%+")
                         print(f"   Missing {65 - trade_score['total_score']:.1f} points for 65% trade signal")
+                        
+                        # LOG REJECTED TRADE
+                        # LOG REJECTED TRADE
+                        # Calculate missing details for logging
+                        try:
+                            # 1. Velocity
+                            pv_data = result['methods'].get('price_velocity', {'direction': 'NEUTRAL', 'confidence': 0})
+                            vel_conf = pv_data.get('confidence', 0)
+                            vel_dir = pv_data.get('direction', 'NEUTRAL')
+                            
+                            # 2. RSI & ADX
+                            current_rsi = df.iloc[-1].get('rsi_14', 0) if not df.empty else 0
+                            current_adx = df.iloc[-1].get('adx', 0) if not df.empty else 0
+                            
+                            # 3. Signal Type
+                            sig_type = 'N/A'
+                            if vel_dir == 'BUYERS' and vel_conf > 0.5:
+                                sig_type = 'CE'
+                            elif vel_dir == 'SELLERS' and vel_conf > 0.5:
+                                sig_type = 'PE'
+                                
+                        except Exception as e:
+                            print(f"[LOG ERROR] Stats calculation failed: {e}")
+                            vel_conf = 0
+                            current_rsi = 0
+                            current_adx = 0
+                            sig_type = 'N/A'
+
+                        details = {
+                            'score': trade_score['total_score'],
+                            'required': 65,
+                            'direction': result['direction'],
+                            'breakdown': str(trade_score.get('breakdown', {})).replace(',', ';'),
+                            'velocity': vel_conf,
+                            'rsi': current_rsi,
+                            'adx': current_adx,
+                            'signal_type': sig_type
+                        }
+                        self.log_rejected_trade("BLOCK_LOW_SCORE", details)
                         
                         if result['direction'] == 'BALANCED':
                             print(f"\n[NEUTRAL] MARKET BALANCED - Wait for clearer direction")
