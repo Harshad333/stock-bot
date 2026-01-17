@@ -190,7 +190,7 @@ class EnhancedBuyerSellerDetectionSensitive:
                     response = self.client.getCandleData({
                         "exchange": "NSE",
                         "symboltoken": "99926000",
-                        "interval": "ONE_MINUTE",
+                        "interval": "FIVE_MINUTE",
                         "fromdate": start_time.strftime("%Y-%m-%d %H:%M"),
                         "todate": end_time.strftime("%Y-%m-%d %H:%M")
                     })
@@ -217,6 +217,32 @@ class EnhancedBuyerSellerDetectionSensitive:
         except Exception as e:
             print(f"[ERROR] Tick data failed: {e}")
             return self.create_synthetic_data()
+    
+    def get_5min_data(self):
+        """Get 5-minute candle data for trend confirmation"""
+        try:
+            end_time = datetime.datetime.now()
+            start_time = end_time - datetime.timedelta(hours=2)
+            
+            response = self.client.getCandleData({
+                "exchange": "NSE",
+                "symboltoken": "99926000",
+                "interval": "FIVE_MINUTE",
+                "fromdate": start_time.strftime("%Y-%m-%d %H:%M"),
+                "todate": end_time.strftime("%Y-%m-%d %H:%M")
+            })
+            
+            if response and response.get('data'):
+                df = pd.DataFrame(response['data'], 
+                                columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                return df.dropna()
+            return None
+        except Exception as e:
+            print(f"[ERROR] 5min data failed: {e}")
+            return None
     
     def create_synthetic_data(self):
         """Create synthetic data when API fails"""
@@ -264,6 +290,10 @@ class EnhancedBuyerSellerDetectionSensitive:
         df = self.calculate_enhanced_indicators(df)
         latest = df.iloc[-1]
         
+        # Get 5-minute trend confirmation
+        df_5min = self.get_5min_data()
+        trend_5min = self.analyze_5min_trend(df_5min) if df_5min is not None else {'direction': 'NEUTRAL', 'confidence': 0.5}
+        
         # IMMEDIATE MOMENTUM CHECK (NEW)
         immediate_momentum = self.check_immediate_momentum(df)
         
@@ -276,10 +306,42 @@ class EnhancedBuyerSellerDetectionSensitive:
             'support_resistance': self.detect_sr_pressure_sensitive(df),
             'price_velocity': self.detect_price_velocity(df),  # NEW: Speed detection
             'movement_diversion': self.detect_movement_diversion(df),  # NEW: Movement diversion detection
-            'operator_activity': self.detect_operator_activity(df)  # NEW: Operator activity detection
+            'operator_activity': self.detect_operator_activity(df),  # NEW: Operator activity detection
+            '5min_trend': trend_5min  # NEW: 5-minute trend confirmation
         }
         
         # Enhanced weighted scoring with peak detection
+        buyer_score = 0
+        seller_score = 0
+        
+        # Peak/Trough filter
+        current_peak = latest.get('is_peak', False)
+        current_trough = latest.get('is_trough', False)
+        
+        # Peak filter - reduce buy signals at peaks (removed BB check)
+        peak_penalty = 0.3 if current_peak else 0
+        trough_penalty = 0.3 if current_trough else 0
+        
+        # 5-minute trend boost/penalty
+        trend_boost = 0.2 if trend_5min['direction'] != 'NEUTRAL' else 0
+        
+        # FIXED WEIGHTS - Total = 100% (LOWERED DOMINANCE THRESHOLD)
+        
+        # Immediate momentum (25% weight) - Reduced to accommodate 5min
+        im = methods['immediate_momentum']
+        if im['direction'] == 'BUYERS':
+            boost = trend_boost if trend_5min['direction'] == 'BUYERS' else 0
+            buyer_score += im['confidence'] * 0.25 * (1 - peak_penalty) * (1 + boost)
+        elif im['direction'] == 'SELLERS':
+            boost = trend_boost if trend_5min['direction'] == 'SELLERS' else 0
+            seller_score += im['confidence'] * 0.25 * (1 - trough_penalty) * (1 + boost)
+        
+        # 5-minute trend confirmation (20% weight) - NEW
+        trend_5 = methods['5min_trend']
+        if trend_5['direction'] == 'BUYERS':
+            buyer_score += trend_5['confidence'] * 0.20
+        elif trend_5['direction'] == 'SELLERS':
+            seller_score += trend_5['confidence'] * 0.20
         buyer_score = 0
         seller_score = 0
         
@@ -745,6 +807,52 @@ class EnhancedBuyerSellerDetectionSensitive:
             
         except Exception as e:
             return {'direction': 'NEUTRAL', 'confidence': 0.5, 'signals': []}
+    
+    def analyze_5min_trend(self, df_5min):
+        """Analyze 5-minute trend for confirmation"""
+        try:
+            if df_5min is None or len(df_5min) < 6:
+                return {'direction': 'NEUTRAL', 'confidence': 0.5}
+            
+            recent_6 = df_5min.tail(6)
+            
+            # Price trend over 30 minutes (6 candles)
+            price_start = recent_6['close'].iloc[0]
+            price_end = recent_6['close'].iloc[-1]
+            price_change = price_end - price_start
+            price_change_pct = (price_change / price_start) * 100
+            
+            # Volume trend
+            recent_vol = recent_6['volume'].mean()
+            earlier_vol = df_5min['volume'].mean() if len(df_5min) > 6 else recent_vol
+            vol_ratio = recent_vol / earlier_vol if earlier_vol > 0 else 1
+            
+            # Trend strength calculation
+            if abs(price_change) > 50:  # Strong trend (50+ points)
+                confidence = min(0.9, 0.7 + abs(price_change_pct) * 0.05)
+            elif abs(price_change) > 25:  # Medium trend
+                confidence = 0.75
+            elif abs(price_change) > 10:  # Weak trend
+                confidence = 0.65
+            else:  # No clear trend
+                confidence = 0.5
+            
+            # Volume confirmation
+            if vol_ratio > 1.3:
+                confidence *= 1.1
+            elif vol_ratio < 0.8:
+                confidence *= 0.9
+            
+            # Direction determination
+            if price_change > 10:
+                return {'direction': 'BUYERS', 'confidence': min(confidence, 0.95)}
+            elif price_change < -10:
+                return {'direction': 'SELLERS', 'confidence': min(confidence, 0.95)}
+            else:
+                return {'direction': 'NEUTRAL', 'confidence': 0.5}
+                
+        except Exception as e:
+            return {'direction': 'NEUTRAL', 'confidence': 0.5}
     
     # REMOVED: get_bb_data_5min and calculate_bollinger_bands functions
     # BB calculation is now done directly in calculate_enhanced_indicators

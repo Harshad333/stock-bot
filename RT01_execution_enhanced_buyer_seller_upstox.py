@@ -1323,15 +1323,13 @@ class EnhancedBuyerSellerDetectionUpstox:
             return {'direction': 'NEUTRAL', 'confidence': 0.5}
     
     def calculate_enhanced_indicators(self, df):
-        """Calculate enhanced indicators including Bollinger Bands and Relative Volatility"""
-        # --- Existing Calculations ---
+        """Calculate enhanced indicators"""
         df['volume_ma'] = df['volume'].rolling(5).mean()
         df['volume_ratio'] = df['volume'] / df['volume_ma']
         
         df['price_change'] = df['close'].diff()
         df['price_velocity'] = df['price_change'].rolling(2).mean()
         
-        # Peaks and Troughs
         df['is_peak'] = False
         df['is_trough'] = False
         if len(df) >= 3:
@@ -1352,7 +1350,7 @@ class EnhancedBuyerSellerDetectionUpstox:
         df['resistance'] = df['high'].rolling(10).max()
         df['support'] = df['low'].rolling(10).min()
         
-        # --- ATR Calculation ---
+        # ATR Calculation for Consolidation Detection
         df['tr'] = np.maximum(
             df['high'] - df['low'],
             np.maximum(
@@ -1363,26 +1361,7 @@ class EnhancedBuyerSellerDetectionUpstox:
         df['atr'] = df['tr'].rolling(14).mean()
         df['atr_percent'] = (df['atr'] / df['close']) * 100
         
-        # --- NEW: Dynamic ATR (Relative Volatility) ---
-        # Compare current ATR to the average ATR of the last 30 candles
-        df['atr_ma_30'] = df['atr'].rolling(30).mean()
-        df['relative_volatility'] = df['atr'] / df['atr_ma_30']
-        
-        # --- NEW: Bollinger Band Squeeze ---
-        # 20 SMA
-        df['sma_20'] = df['close'].rolling(20).mean()
-        # Standard Deviation
-        df['std_20'] = df['close'].rolling(20).std()
-        df['bb_upper'] = df['sma_20'] + (df['std_20'] * 2)
-        df['bb_lower'] = df['sma_20'] - (df['std_20'] * 2)
-        
-        # Bandwidth %: How wide are the bands relative to price?
-        df['bb_bandwidth'] = ((df['bb_upper'] - df['bb_lower']) / df['sma_20']) * 100
-        
-        # Bandwidth Low (Squeeze detection): Is current bandwidth the lowest in 20 periods?
-        df['bb_squeeze'] = df['bb_bandwidth'] < df['bb_bandwidth'].rolling(20).min().shift(1) + 0.05
-        
-        # --- RSI & ADX (Existing Logic maintained below) ---
+        # RSI Calculation (14-period) for Trade Validation
         delta = df['close'].diff()
         gain = delta.where(delta > 0, 0)
         loss = (-delta).where(delta < 0, 0)
@@ -1391,38 +1370,52 @@ class EnhancedBuyerSellerDetectionUpstox:
         rs = avg_gain / avg_loss
         df['rsi_14'] = 100 - (100 / (1 + rs))
         
-        # ADX Calculation
+        # ADX Calculation (14-period) for Trend Strength
+        # Step 1: Calculate +DM and -DM
         df['high_diff'] = df['high'].diff()
-        df['low_diff'] = df['low'].diff().abs() * -1
-        df['plus_dm'] = np.where((df['high_diff'] > 0) & (df['high_diff'] > df['low_diff'].abs()), df['high_diff'], 0)
-        df['minus_dm'] = np.where((df['low_diff'].abs() > 0) & (df['low_diff'].abs() > df['high_diff']), df['low_diff'].abs(), 0)
+        df['low_diff'] = df['low'].diff().abs() * -1  # Make negative for comparison
         
+        df['plus_dm'] = np.where(
+            (df['high_diff'] > 0) & (df['high_diff'] > df['low_diff'].abs()),
+            df['high_diff'],
+            0
+        )
+        df['minus_dm'] = np.where(
+            (df['low_diff'].abs() > 0) & (df['low_diff'].abs() > df['high_diff']),
+            df['low_diff'].abs(),
+            0
+        )
+        
+        # Step 2: Smooth +DM, -DM and TR (14-period)
         df['smooth_plus_dm'] = df['plus_dm'].rolling(14).sum()
         df['smooth_minus_dm'] = df['minus_dm'].rolling(14).sum()
         df['smooth_tr'] = df['tr'].rolling(14).sum()
         
+        # Step 3: Calculate +DI and -DI
         df['plus_di'] = (df['smooth_plus_dm'] / df['smooth_tr']) * 100
         df['minus_di'] = (df['smooth_minus_dm'] / df['smooth_tr']) * 100
+        
+        # Step 4: Calculate DX
         df['di_diff'] = abs(df['plus_di'] - df['minus_di'])
         df['di_sum'] = df['plus_di'] + df['minus_di']
         df['dx'] = (df['di_diff'] / df['di_sum']) * 100
+        
+        # Step 5: Calculate ADX (14-period smoothed average of DX)
         df['adx'] = df['dx'].rolling(14).mean()
         
         return df
     
     def detect_consolidation(self, df, lookback=14):
         """
-        Detect Consolidation using Hybrid Approach:
-        1. Bollinger Band Squeeze (Primary)
-        2. ADX < 20 (Trend Weakness)
-        3. Relative Volatility (Current ATR vs Historical ATR)
-        4. Tight Box Detection (Price Range)
+        Detect if market is in consolidation using ATR
+        Low ATR = Consolidation (sideways market)
+        High ATR = Trending market
         
         Returns:
             dict with consolidation status and metrics
         """
         try:
-            if df is None or len(df) < 30:  # Increased requirement for BB/ATR_MA
+            if df is None or len(df) < lookback:
                 return {
                     'is_consolidating': False,
                     'atr_percent': 0,
@@ -1431,91 +1424,55 @@ class EnhancedBuyerSellerDetectionUpstox:
                 }
             
             latest = df.iloc[-1]
+            atr_percent = latest.get('atr_percent', 0)
             
-            # 1. Bollinger Band Width Analysis
-            bb_bandwidth = latest.get('bb_bandwidth', 1.0)
-            if pd.isna(bb_bandwidth):
-                bb_bandwidth = 1.0
-            # If bandwidth is very low (e.g., < 0.20% on Nifty is extremely tight)
-            is_bb_squeeze = bb_bandwidth < 0.20
+            if pd.isna(atr_percent):
+                atr_percent = 0
             
-            # 2. ADX Analysis (Classic Consolidation)
-            adx_value = latest.get('adx', 25)
-            if pd.isna(adx_value):
-                adx_value = 25
-            is_low_adx = adx_value < 20
+            # ATR Thresholds for NIFTY (adjust as needed)
+            # < 0.15% = Strong Consolidation
+            # 0.15% - 0.25% = Mild Consolidation
+            # 0.25% - 0.40% = Normal Market
+            # > 0.40% = High Volatility/Trending
             
-            # 3. Relative Volatility (Dynamic ATR)
-            # If current volatility is < 75% of the 30-period average volatility
-            rel_vol = latest.get('relative_volatility', 1.0)
-            if pd.isna(rel_vol):
-                rel_vol = 1.0
-            is_volatility_dropping = rel_vol < 0.75
+            if atr_percent < 0.15:
+                is_consolidating = True
+                market_state = 'STRONG_CONSOLIDATION'
+                consolidation_strength = 1.0
+            elif atr_percent < 0.25:
+                is_consolidating = True
+                market_state = 'MILD_CONSOLIDATION'
+                consolidation_strength = 0.7
+            elif atr_percent < 0.40:
+                is_consolidating = False
+                market_state = 'NORMAL_TRENDING'
+                consolidation_strength = 0.3
+            else:
+                is_consolidating = False
+                market_state = 'HIGH_VOLATILITY'
+                consolidation_strength = 0.0
             
-            # 4. Price Range (Box Check)
-            recent = df.tail(10)  # check last 10 candles
+            # Additional check: Price range in last N candles
+            recent = df.tail(lookback)
             high_range = recent['high'].max()
             low_range = recent['low'].min()
             avg_price = recent['close'].mean()
             range_percent = ((high_range - low_range) / avg_price) * 100 if avg_price > 0 else 0
-            is_tight_box = range_percent < 0.35
             
-            # --- DECISION LOGIC ---
-            consolidation_score = 0
-            reasons = []
-            
-            if is_bb_squeeze:
-                consolidation_score += 40
-                reasons.append("BB_SQUEEZE")
-            
-            if is_low_adx:
-                consolidation_score += 30
-                reasons.append("LOW_ADX")
-            
-            if is_volatility_dropping:
-                consolidation_score += 20
-                reasons.append("VOL_DROP")
-            
-            if is_tight_box:
-                consolidation_score += 30
-                reasons.append("TIGHT_BOX")
-            
-            # Determine State
-            is_consolidating = False
-            market_state = 'NORMAL_TRENDING'
-            strength = 0.3
-            
-            if consolidation_score >= 50:
+            # If range is very tight, it's consolidation regardless of ATR
+            if range_percent < 0.3:
                 is_consolidating = True
-                if consolidation_score >= 80:
-                    market_state = 'STRONG_CONSOLIDATION'
-                    strength = 1.0
-                else:
-                    market_state = 'MILD_CONSOLIDATION'
-                    strength = 0.7
-            elif latest.get('atr_percent', 0.5) > 0.40:
-                market_state = 'HIGH_VOLATILITY'
-                strength = 0.0
-            else:
-                market_state = 'NORMAL_TRENDING'
-                strength = 0.3
-            
-            # Get ATR percent for backward compatibility
-            atr_percent = latest.get('atr_percent', 0)
-            if pd.isna(atr_percent):
-                atr_percent = 0
+                if market_state not in ['STRONG_CONSOLIDATION', 'MILD_CONSOLIDATION']:
+                    market_state = 'TIGHT_RANGE_CONSOLIDATION'
+                consolidation_strength = max(consolidation_strength, 0.8)
             
             return {
                 'is_consolidating': is_consolidating,
                 'atr_percent': round(atr_percent, 4),
                 'range_percent': round(range_percent, 4),
                 'market_state': market_state,
-                'consolidation_strength': round(strength, 2),
-                'atr_value': round(latest.get('atr', 0), 2),
-                'bb_bandwidth': round(bb_bandwidth, 4),
-                'adx': round(adx_value, 2),
-                'consolidation_score': consolidation_score,
-                'reasons': reasons
+                'consolidation_strength': round(consolidation_strength, 2),
+                'atr_value': round(latest.get('atr', 0), 2)
             }
             
         except Exception as e:
@@ -2132,8 +2089,6 @@ class EnhancedBuyerSellerDetectionUpstox:
         Phase 3 (30%+): 28% lock, then +2% every 2% step (SUPER TIGHT)
         """
         try:
-            if entry_price <= 0:
-                return current_sl, False
             profit_percent = ((current_price - entry_price) / entry_price) * 100
             
             # If not yet at 7% profit, keep initial SL
@@ -2256,14 +2211,14 @@ class EnhancedBuyerSellerDetectionUpstox:
             
             # Skip invalid positions (entry_price = 0)
             if entry_price <= 0:
-                print(f"  [SKIP] {symbol}: Invalid entry price ({entry_price})")
+                print(f"  [SKIP] {symbol}: Invalid entry price (0) - Close manually in Upstox")
                 continue
             
             current_ltp = self.get_option_ltp(symbol, token)
             
             if current_ltp:
                 pnl = (current_ltp - entry_price) * position['quantity']
-                pnl_percent = ((current_ltp - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+                pnl_percent = ((current_ltp - entry_price) / entry_price) * 100
                 
                 print(f"  {symbol}: ₹{current_ltp:.1f} | P&L: ₹{pnl:+.0f} ({pnl_percent:+.1f}%) | SL: {position['sl_price']:.1f}")
                 
@@ -2515,49 +2470,12 @@ class EnhancedBuyerSellerDetectionUpstox:
     # TRADE SCORING & RECOMMENDATIONS
     # =========================================================================
     
-    def calculate_trade_score(self, result, trend_filter, df_check=None):
-        """
-        Calculate Trade Score with Dynamic Weighting for Index (Zero Volume)
-        """
+    def calculate_trade_score(self, result, trend_filter):
+        """Calculate 100-point trade score"""
         try:
             score_breakdown = {}
             total_score = 0
             
-            # 1. Determine if we have valid volume data
-            # If volume is 0 or missing, we must redistribute those 28 points
-            has_volume = False
-            if df_check is not None and not df_check.empty:
-                if df_check['volume'].sum() > 0:
-                    has_volume = True
-            
-            # Define Weights based on Data Availability
-            if has_volume:
-                # Original Weights (Total 100)
-                w_velocity = 40
-                w_dominance = 15
-                w_trend = 15
-                w_candle = 10
-                w_timing = 7
-                # Volume Specific
-                w_diversion = 10
-                w_operator = 10
-                w_vol_mom = 8
-            else:
-                # Re-weighted for Price Action Only (Total 100)
-                # Redistributed 28 volume points to Velocity, Trend, and Dominance
-                w_velocity = 55  # +15 boost
-                w_dominance = 20 # +5 boost
-                w_trend = 18     # +3 boost
-                w_candle = 15    # +5 boost
-                w_timing = 7     # Unchanged
-                # Volume Specific (Disabled)
-                w_diversion = 0
-                w_operator = 0
-                w_vol_mom = 0
-                
-                print(f"\n[⚠️ WARNING] Zero Volume Detected (Index?). Re-weighting score for Price Action only.")
-
-            # --- DIRECTION LOGIC ---
             if result['buyer_score'] > result['seller_score']:
                 dominant_score = result['buyer_score']
                 signal_direction = 'BUY'
@@ -2565,116 +2483,98 @@ class EnhancedBuyerSellerDetectionUpstox:
                 dominant_score = result['seller_score']
                 signal_direction = 'SELL'
             
-            # 1. Price Velocity
+            # Price Velocity (40 points)
             price_velocity_data = result['methods'].get('price_velocity', {'confidence': 0})
             price_velocity = price_velocity_data['confidence']
-            velocity_score = w_velocity if price_velocity > 0.65 else 0
+            velocity_score = 40 if price_velocity > 0.65 else 0
             score_breakdown['Price Velocity (>0.65)'] = {
                 'current': price_velocity, 'required': 0.65,
                 'percentage': velocity_score, 'achieved': price_velocity > 0.65,
-                'max_points': w_velocity
+                'max_points': 40
             }
             total_score += velocity_score
             
-            # 2. Dominance
-            dominance_score = w_dominance if dominant_score > 0.13 else 0
+            # Dominance (15 points)
+            dominance_score = 15 if dominant_score > 0.13 else 0
             score_breakdown['Buyer/Seller Dominance (>0.13)'] = {
                 'current': dominant_score, 'required': 0.13,
                 'percentage': dominance_score, 'achieved': dominant_score > 0.13,
-                'max_points': w_dominance
+                'max_points': 15
             }
             total_score += dominance_score
             
-            # 3. Candle Analysis
+            # Candle (10 points)
             candle_data = result['methods'].get('candle_body_analysis', {'confidence': 0.5, 'direction': 'NEUTRAL'})
             candle_confidence = candle_data['confidence']
-            candle_score = w_candle if (candle_confidence > 0.6 and candle_data['direction'] != 'NEUTRAL') else 0
+            candle_score = 10 if (candle_confidence > 0.6 and candle_data['direction'] != 'NEUTRAL') else 0
             score_breakdown['Candle Body Analysis (>0.6)'] = {
                 'current': candle_confidence, 'required': 0.6,
                 'percentage': candle_score, 'achieved': candle_confidence > 0.6,
-                'max_points': w_candle
+                'max_points': 10
             }
             total_score += candle_score
             
-            # --- VOLUME BASED INDICATORS (Only if has_volume) ---
-            if has_volume:
-                # Movement Diversion
-                div_data = result['methods'].get('movement_diversion', {'confidence': 0.5, 'type': 'NONE'})
-                div_confidence = div_data.get('confidence', 0.5)
-                div_type = div_data.get('type', 'NONE')
-                div_score = w_diversion if ('DIVERGENCE' in div_type and div_confidence > 0.65) else 0
-                score_breakdown['Movement Diversion'] = {
-                    'current': div_confidence, 'required': 0.65,
-                    'percentage': div_score, 'achieved': div_score > 0,
-                    'max_points': w_diversion
-                }
-                total_score += div_score
-
-                # Operator Activity
-                op_data = result['methods'].get('operator_activity', {'operator_score': 0, 'confidence': 0})
-                op_score_val = op_data.get('operator_score', 0)
-                op_confidence = op_data.get('confidence', 0)
-                op_score = w_operator if (op_score_val > 0.6 or op_confidence > 0.6) else 0
-                score_breakdown['Operator Activity'] = {
-                    'current': max(op_score_val, op_confidence), 'required': 0.6,
-                    'percentage': op_score, 'achieved': op_score > 0,
-                    'max_points': w_operator
-                }
-                total_score += op_score
-
-                # Volume Momentum
-                vol_data = result['methods'].get('volume_price_trend', {'confidence': 0.5, 'direction': 'NEUTRAL'})
-                vol_confidence = vol_data.get('confidence', 0.5)
-                vol_direction = vol_data.get('direction', 'NEUTRAL')
-                vol_score = w_vol_mom if (vol_confidence > 0.55 and vol_direction != 'NEUTRAL') else 0
-                score_breakdown['Volume Momentum'] = {
-                    'current': vol_confidence, 'required': 0.55,
-                    'percentage': vol_score, 'achieved': vol_score > 0,
-                    'max_points': w_vol_mom
-                }
-                total_score += vol_score
+            # Diversion (10 points)
+            diversion_data = result['methods'].get('movement_diversion', {'confidence': 0.5, 'type': 'NO_DIVERGENCE'})
+            diversion_type = diversion_data.get('type', 'NO_DIVERGENCE')
+            diversion_confidence = diversion_data['confidence']
+            diversion_score = 10 if ('DIVERGENCE' in diversion_type and diversion_confidence > 0.65) else 0
+            score_breakdown['Movement Diversion'] = {
+                'current': diversion_confidence, 'required': 0.65,
+                'percentage': diversion_score, 'achieved': diversion_score > 0,
+                'max_points': 10
+            }
+            total_score += diversion_score
             
-            # 4. Market Timing
+            # Operator (10 points)
+            operator_data = result['methods'].get('operator_activity', {'operator_score': 0, 'direction': 'NEUTRAL'})
+            operator_score_raw = operator_data.get('operator_score', 0)
+            operator_score = 10 if (operator_score_raw > 0.6 and operator_data['direction'] != 'NEUTRAL') else 0
+            score_breakdown['Operator Activity'] = {
+                'current': operator_score_raw, 'required': 0.6,
+                'percentage': operator_score, 'achieved': operator_score_raw > 0.6,
+                'max_points': 10
+            }
+            total_score += operator_score
+            
+            # Volume (8 points)
+            volume_data = result['methods'].get('volume_price_trend', {'confidence': 0.5, 'direction': 'NEUTRAL'})
+            volume_confidence = volume_data['confidence']
+            volume_score = 8 if (volume_confidence > 0.55 and volume_data['direction'] != 'NEUTRAL') else 0
+            score_breakdown['Volume Momentum'] = {
+                'current': volume_confidence, 'required': 0.55,
+                'percentage': volume_score, 'achieved': volume_confidence > 0.55,
+                'max_points': 8
+            }
+            total_score += volume_score
+            
+            # Timing (7 points)
             current_time = datetime.datetime.now()
             market_hour = current_time.hour
             prime_time = (9 <= market_hour < 11) or (13 <= market_hour < 15)
-            timing_score = w_timing if prime_time else 0
+            timing_score = 7 if prime_time else 0
             score_breakdown['Market Timing'] = {
-                'current': market_hour, 'required': 10, 
+                'current': market_hour, 'required': 10,
                 'percentage': timing_score, 'achieved': prime_time,
-                'max_points': w_timing
+                'max_points': 7
             }
             total_score += timing_score
             
-            # 5. Consolidation Penalty (-20 points if consolidating)
+            # Consolidation Penalty (-20 points if consolidating)
             consolidation_data = result['methods'].get('consolidation', {'is_consolidating': False, 'market_state': 'UNKNOWN'})
             is_consolidating = consolidation_data.get('is_consolidating', False)
             market_state = consolidation_data.get('market_state', 'UNKNOWN')
             atr_percent = consolidation_data.get('atr_percent', 0)
-            consol_score = consolidation_data.get('consolidation_score', 0)
-            consol_reasons = consolidation_data.get('reasons', [])
-            bb_bandwidth = consolidation_data.get('bb_bandwidth', 0)
             consolidation_penalty = -20 if is_consolidating else 0
-            
-            # Build display value showing new multi-factor score
-            if is_consolidating:
-                display_value = f"Score:{consol_score}/100 [{', '.join(consol_reasons)}]"
-            else:
-                display_value = f"ATR:{atr_percent:.2f}% BB:{bb_bandwidth:.2f}%"
-            
-            score_breakdown['Consolidation Detection'] = {
+            score_breakdown['Consolidation (ATR)'] = {
                 'current': atr_percent, 'required': 0.25,
                 'percentage': consolidation_penalty, 'achieved': not is_consolidating,
                 'market_state': market_state,
-                'consolidation_score': consol_score,
-                'bb_bandwidth': bb_bandwidth,
-                'reasons': ', '.join(consol_reasons) if consol_reasons else 'NONE',
-                'display_value': display_value,
                 'max_points': 0  # Penalty only
             }
             total_score += consolidation_penalty
             
-            # 6. ADX Trend Strength
+            # ADX Trend Strength (+15 points if strong trend, -10 if no trend)
             trend_data = result['methods'].get('trend_strength', {'adx_value': 0, 'trend_status': 'UNKNOWN', 'is_trending': False, 'trend_direction': 'NEUTRAL'})
             adx_value = trend_data.get('adx_value', 0)
             trend_status = trend_data.get('trend_status', 'UNKNOWN')
@@ -2690,7 +2590,7 @@ class EnhancedBuyerSellerDetectionUpstox:
             
             # Calculate ADX score
             if is_trending and trend_matches_signal:
-                adx_score = w_trend  # Bonus for trending in same direction
+                adx_score = 15  # Bonus for trending in same direction
             elif is_trending and not trend_matches_signal:
                 adx_score = -5  # Penalty for counter-trend trade
             elif adx_value < 20:
@@ -2703,11 +2603,11 @@ class EnhancedBuyerSellerDetectionUpstox:
                 'percentage': adx_score, 'achieved': is_trending and trend_matches_signal,
                 'trend_status': trend_status,
                 'trend_direction': trend_direction,
-                'max_points': w_trend
+                'max_points': 15
             }
             total_score += adx_score
             
-            # Final Cap
+            # Ensure score doesn't go below 0
             total_score = max(total_score, 0)
             
             if total_score >= 80:
@@ -2898,7 +2798,7 @@ class EnhancedBuyerSellerDetectionUpstox:
                     print(f"Actual Seller Score: {result['seller_score']:.3f}")
                     
                     # Trade Scoring System
-                    trade_score = self.calculate_trade_score(result, trend_filter, df)
+                    trade_score = self.calculate_trade_score(result, trend_filter)
                     
                     print(f"\n[TRADE SCORING SYSTEM]")
                     print("=" * 105)
@@ -3120,4 +3020,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
