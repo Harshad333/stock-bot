@@ -19,19 +19,44 @@ import math
 import webbrowser
 import pyotp
 from openpyxl import Workbook, load_workbook
+from urllib.parse import urlparse, parse_qs
+
+# Upstox TOTP auto-login package
+try:
+    from upstox_totp import UpstoxTOTP
+    UPSTOX_TOTP_AVAILABLE = True
+except ImportError:
+    UPSTOX_TOTP_AVAILABLE = False
+    print("⚠️ upstox-totp not installed. Run: pip install upstox-totp")
+
+# Selenium imports for fallback auto-login
+try:
+    from selenium import webdriver
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+    SELENIUM_AVAILABLE = True
+except ImportError:
+    SELENIUM_AVAILABLE = False
 
 class EnhancedBuyerSellerDetectionUpstox:
     def __init__(self):
         # Upstox Credentials
-        self.API_KEY = "43fdf842-a9e1-4f20-9977-b6d1e4c8a9dc"
-        self.API_SECRET = "gs1ge527c7"  # UPDATE THIS with correct API Secret
-        self.REDIRECT_URI = "https://account.upstox.com/developer/apps/createapp"
-        self.ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiJBQzY3MjciLCJqdGkiOiI2OTU3NDJmMzk3ZTk0ZDI3ODZmNDU3Y2QiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlhdCI6MTc2NzMyNjQ1MSwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxNzY3MzkxMjAwfQ.0_4YtlXfYlxgBQvz5MIzsLbwAdqGQoDVx0tAPl5-NbU"
+        self.API_KEY = "462f6c2f-010f-43c2-9850-537e9d8db66e"
+        self.API_SECRET = "acd00t5bnu"  # UPDATE THIS with correct API Secret
+        self.REDIRECT_URI = "https://www.google.com/"
+        self.ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiJBQzY3MjciLCJqdGkiOiI2OTZiYWNiNTNkODJjNDc2OGI2OGNiMzUiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlhdCI6MTc2ODY2NDI0NSwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxNzY4Njg3MjAwfQ.J90FRWH9-VwWxeRJDqGZthxKiKuVwzA96myhULFs0AY"
         
-        # TOTP Auto-Login Credentials (Fill these for auto-login)
-        self.UPSTOX_MOBILE = ""      # Your registered mobile number
-        self.UPSTOX_PIN = ""         # Your 6-digit Upstox PIN
-        self.TOTP_SECRET = ""        # TOTP Secret from Upstox App (Settings -> 2FA)
+        # ======= AUTO-LOGIN CREDENTIALS (FILL THESE FOR AUTOMATIC LOGIN) =======
+        # Option 1: Fill mobile + PIN only → Script will ask for OTP from email/SMS
+        # Option 2: Fill mobile + PIN + TOTP_SECRET → Fully automatic, no manual input
+        self.UPSTOX_MOBILE = "9921316390"      # Your registered mobile number (e.g., "9876543210")
+        self.UPSTOX_PIN = "602633"         # Your 6-digit Upstox PIN (e.g., "123456")
+        self.TOTP_SECRET = "N3CPE5KR57VMK7JEYP46JSHQLFGQZ5PA"        # Optional: TOTP Secret for fully automatic login
+        # To get TOTP_SECRET: Upstox App → Profile → Settings → Security → 2FA → Show Secret Key
+        # =========================================================================
         
         # Token Storage
         self.TOKEN_FILE = "upstox_token.json"
@@ -257,102 +282,188 @@ class EnhancedBuyerSellerDetectionUpstox:
     
     def _auto_login_with_totp(self):
         """
-        Automatic login using TOTP - No manual interaction needed!
-        Requires: UPSTOX_MOBILE, UPSTOX_PIN, TOTP_SECRET
+        Automatic login using upstox-totp package
+        This is the recommended approach for fully automatic login
+        Falls back to Selenium if package login fails
         """
         print("\n" + "="*60)
-        print("  🤖 TOTP AUTO-LOGIN")
+        print("  🤖 AUTO-LOGIN (upstox-totp)")
         print("="*60)
         
-        # Check if TOTP credentials are configured
-        if not all([self.UPSTOX_MOBILE, self.UPSTOX_PIN, self.TOTP_SECRET]):
-            print("\n❌ TOTP credentials not configured!")
-            print("   Please fill these in the script:")
-            print("   - UPSTOX_MOBILE: Your registered mobile")
-            print("   - UPSTOX_PIN: Your 6-digit PIN")
-            print("   - TOTP_SECRET: From Upstox App (Settings -> 2FA)")
+        # Method 1: Try upstox-totp package (recommended)
+        if UPSTOX_TOTP_AVAILABLE and self.UPSTOX_MOBILE and self.UPSTOX_PIN and self.TOTP_SECRET:
+            try:
+                print("[LOGIN] Using upstox-totp package...")
+                
+                # Set environment variables for upstox-totp (using correct var names)
+                os.environ['UPSTOX_USERNAME'] = self.UPSTOX_MOBILE
+                os.environ['UPSTOX_PASSWORD'] = self.UPSTOX_PIN  # Password is PIN for Upstox
+                os.environ['UPSTOX_PIN_CODE'] = self.UPSTOX_PIN
+                os.environ['UPSTOX_TOTP_SECRET'] = self.TOTP_SECRET
+                os.environ['UPSTOX_CLIENT_ID'] = self.API_KEY
+                os.environ['UPSTOX_CLIENT_SECRET'] = self.API_SECRET
+                os.environ['UPSTOX_REDIRECT_URI'] = self.REDIRECT_URI
+                os.environ['UPSTOX_DEBUG'] = 'false'
+                
+                # Initialize upstox-totp client
+                upx = UpstoxTOTP()
+                
+                # Generate access token
+                print("[LOGIN] Generating access token...")
+                response = upx.app_token.get_access_token()
+                
+                if response.success and response.data:
+                    self.ACCESS_TOKEN = response.data.access_token
+                    configuration = upstox_client.Configuration()
+                    configuration.access_token = self.ACCESS_TOKEN
+                    self.api_client = upstox_client.ApiClient(configuration)
+                    self.session_generated = True
+                    
+                    print(f"\n✅ Auto-login successful!")
+                    print(f"   User: {response.data.user_name} ({response.data.user_id})")
+                    if hasattr(response.data, 'email'):
+                        print(f"   Email: {response.data.email}")
+                    
+                    self._save_token(self.ACCESS_TOKEN)
+                    self._update_token_in_file(self.ACCESS_TOKEN)
+                    return True
+                else:
+                    print(f"[LOGIN] upstox-totp failed: {response}")
+                    
+            except Exception as e:
+                print(f"[LOGIN] upstox-totp error: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Method 2: Fallback to Selenium browser automation
+        print("\n[LOGIN] Falling back to Selenium browser automation...")
+        return self._selenium_auto_login()
+    
+    def _selenium_auto_login(self):
+        """
+        Fallback: Selenium-based browser automation for Upstox login
+        Upstox Login Flow: Mobile → OTP/TOTP → PIN
+        """
+        if not SELENIUM_AVAILABLE:
+            print("\n❌ Selenium not installed!")
+            print("   Run: pip install selenium")
             return False
         
+        if not self.UPSTOX_MOBILE or not self.UPSTOX_PIN:
+            print("\n❌ Login credentials not configured!")
+            print("   Please fill these in the script:")
+            print("   - UPSTOX_MOBILE: Your registered mobile number")
+            print("   - UPSTOX_PIN: Your 6-digit PIN")
+            print("   - TOTP_SECRET: TOTP secret from Upstox app")
+            return False
+        
+        driver = None
         try:
-            # Generate TOTP
-            totp = pyotp.TOTP(self.TOTP_SECRET)
-            totp_code = totp.now()
-            print(f"[TOTP] Generated code: {totp_code}")
+            chrome_options = Options()
+            chrome_options.add_argument("--disable-gpu")
+            chrome_options.add_argument("--no-sandbox")
+            chrome_options.add_argument("--disable-dev-shm-usage")
+            chrome_options.add_argument("--window-size=1280,800")
+            chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            chrome_options.add_experimental_option('useAutomationExtension', False)
             
-            # Step 1: Initiate login
-            print("[LOGIN] Step 1: Initiating login...")
-            session = requests.Session()
+            print("[LOGIN] Starting Chrome browser...")
+            driver = webdriver.Chrome(options=chrome_options)
+            driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             
-            login_url = "https://api.upstox.com/v2/login/authorization/dialog"
-            params = {
-                "response_type": "code",
-                "client_id": self.API_KEY,
-                "redirect_uri": self.REDIRECT_URI
-            }
+            wait = WebDriverWait(driver, 30)
             
-            # Get the login page
-            resp = session.get(login_url, params=params, allow_redirects=True)
+            # Navigate to authorization URL
+            auth_url = f"https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id={self.API_KEY}&redirect_uri={self.REDIRECT_URI}"
+            print(f"[LOGIN] Opening authorization URL...")
+            driver.get(auth_url)
+            time.sleep(2)
             
-            # Step 2: Submit mobile number
-            print("[LOGIN] Step 2: Submitting mobile number...")
-            mobile_url = "https://api.upstox.com/v2/login/authorization/step1"
-            mobile_data = {
-                "client_id": self.API_KEY,
-                "redirect_uri": self.REDIRECT_URI,
-                "response_type": "code",
-                "mobile_number": self.UPSTOX_MOBILE
-            }
+            # Enter mobile number
+            print(f"[LOGIN] Entering mobile number: {self.UPSTOX_MOBILE[:4]}****")
+            mobile_input = wait.until(EC.presence_of_element_located((By.ID, "mobileNum")))
+            mobile_input.clear()
+            mobile_input.send_keys(self.UPSTOX_MOBILE)
+            time.sleep(0.5)
             
-            headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json"
-            }
+            get_otp_btn = wait.until(EC.element_to_be_clickable((By.ID, "getOtp")))
+            get_otp_btn.click()
+            print("[LOGIN] OTP requested...")
+            time.sleep(3)
             
-            resp = session.post(mobile_url, json=mobile_data, headers=headers)
+            # Enter OTP (TOTP or manual)
+            if self.TOTP_SECRET:
+                print("[LOGIN] Generating TOTP code...")
+                totp = pyotp.TOTP(self.TOTP_SECRET)
+                otp_code = totp.now()
+                print(f"[LOGIN] TOTP code: {otp_code}")
+            else:
+                print("\n" + "-"*50)
+                print("📱 CHECK YOUR EMAIL/SMS FOR OTP")
+                print("-"*50)
+                otp_code = input("Enter OTP: ").strip()
+                if not otp_code:
+                    print("❌ No OTP provided")
+                    driver.quit()
+                    return False
             
-            if resp.status_code != 200:
-                # Try alternative endpoint
-                mobile_url_alt = "https://api-v2.upstox.com/login/authorization/step1"
-                resp = session.post(mobile_url_alt, json=mobile_data, headers=headers)
+            otp_input = wait.until(EC.presence_of_element_located((By.ID, "otpNum")))
+            otp_input.clear()
+            otp_input.send_keys(otp_code)
+            time.sleep(0.5)
             
-            # Step 3: Submit PIN + TOTP
-            print("[LOGIN] Step 3: Submitting PIN + TOTP...")
-            otp_url = "https://api.upstox.com/v2/login/authorization/step2"
-            otp_data = {
-                "client_id": self.API_KEY,
-                "redirect_uri": self.REDIRECT_URI,
-                "response_type": "code",
-                "mobile_number": self.UPSTOX_MOBILE,
-                "pin": self.UPSTOX_PIN,
-                "totp": totp_code
-            }
+            continue_btn = wait.until(EC.element_to_be_clickable((By.ID, "continueBtn")))
+            continue_btn.click()
+            print("[LOGIN] OTP submitted...")
+            time.sleep(3)
             
-            resp = session.post(otp_url, json=otp_data, headers=headers, allow_redirects=False)
+            # Enter PIN
+            print(f"[LOGIN] Entering PIN...")
+            pin_input = wait.until(EC.presence_of_element_located((By.ID, "pinCode")))
+            pin_input.clear()
+            pin_input.send_keys(self.UPSTOX_PIN)
+            time.sleep(0.5)
             
-            # Check for redirect with code
-            if resp.status_code in [302, 303] or 'code=' in str(resp.headers.get('Location', '')):
-                redirect_url = resp.headers.get('Location', '')
-                if 'code=' in redirect_url:
-                    code = redirect_url.split('code=')[1].split('&')[0]
-                    print(f"[LOGIN] Got authorization code: {code[:20]}...")
+            login_btn = wait.until(EC.element_to_be_clickable((By.ID, "pinContinueBtn")))
+            login_btn.click()
+            print("[LOGIN] PIN submitted...")
+            time.sleep(3)
+            
+            # Wait for redirect and capture authorization code
+            print("[LOGIN] Waiting for authorization redirect...")
+            max_wait = 30
+            start_time = time.time()
+            
+            while time.time() - start_time < max_wait:
+                current_url = driver.current_url
+                
+                if self.REDIRECT_URI.split("?")[0] in current_url and "code=" in current_url:
+                    parsed = urlparse(current_url)
+                    params = parse_qs(parsed.query)
                     
-                    # Exchange code for token
+                    if 'code' in params:
+                        auth_code = params['code'][0]
+                        print(f"[LOGIN] Got authorization code: {auth_code[:20]}...")
+                        driver.quit()
+                        return self._exchange_code_for_token(auth_code)
+                
+                if "#code=" in current_url:
+                    code = current_url.split("#code=")[1].split("&")[0]
+                    print(f"[LOGIN] Got authorization code: {code[:20]}...")
+                    driver.quit()
                     return self._exchange_code_for_token(code)
+                
+                time.sleep(1)
             
-            # Try to get code from response
-            if resp.status_code == 200:
-                result = resp.json()
-                if 'code' in result:
-                    return self._exchange_code_for_token(result['code'])
-                elif 'data' in result and 'code' in result.get('data', {}):
-                    return self._exchange_code_for_token(result['data']['code'])
-            
-            print(f"[LOGIN] Response: {resp.status_code} - {resp.text[:200]}")
-            print("\n⚠️ TOTP auto-login failed. Falling back to manual login...")
+            print(f"[LOGIN] Timeout. Current URL: {driver.current_url}")
+            driver.quit()
             return False
             
         except Exception as e:
-            print(f"\n❌ TOTP login error: {e}")
+            print(f"\n❌ Selenium login error: {e}")
+            if driver:
+                driver.quit()
             return False
     
     def _exchange_code_for_token(self, code):
